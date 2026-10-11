@@ -1,0 +1,138 @@
+name: Build ImmortalWrt (Padavanonly Closed-Source)
+
+on:
+  workflow_dispatch: # 支持在 Actions 页面手动触发构建
+  # push:
+  #   branches:
+  #     - main # 如果希望每次提交代码时自动触发，可取消此段注释
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }} - ${{ matrix.variant }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [jdcloud_re-cp-03, cudy_tr3000-v1, cmcc_rax3000m-emmc]
+        variant: [4-plugins, 2-plugins]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Initialize Environment (初始化编译环境)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
+          sudo timedatectl set-timezone "Asia/Shanghai"
+
+      - name: Clone Source Code (拉取固件源码)
+        run: |
+          # 克隆 padavanonly 的 immortalwrt-mt798x 源码分支
+          git clone --depth 1 https://github.com/padavanonly/immortalwrt-mt798x openwrt
+
+      - name: Install Extra Feeds & Plugins (安装外部插件源)
+        working-directory: ./openwrt
+        run: |
+          # 1. 引入 Nikki 软件源
+          echo "src-git nikki https://github.com/kisssssssss/luci-app-nikki" >> feeds.conf.default
+          
+          # 2. 引入 rtp2httpd (官方手动集成模式)
+          git clone --depth 1 https://github.com/stackia/rtp2httpd /tmp/rtp2httpd
+          cp -r /tmp/rtp2httpd/openwrt-support/luci-app-rtp2httpd package/luci-app-rtp2httpd
+          cp -r /tmp/rtp2httpd/openwrt-support/rtp2httpd package/rtp2httpd
+          # 按作者要求重命名编译构建文件
+          mv package/rtp2httpd/Makefile.versioned package/rtp2httpd/Makefile
+          mv package/luci-app-rtp2httpd/Makefile.versioned package/luci-app-rtp2httpd/Makefile
+
+          # 3. 更新并安装所有 feeds
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          
+          # 4. 修改默认主题为 Argon
+          sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' feeds/luci/collections/luci/Makefile
+
+      - name: Generate .config (自动生成编译配置)
+        working-directory: ./openwrt
+        run: |
+          rm -f .config
+          touch .config
+          
+          # --- 目标设备 (Target) ---
+          if [ "${{ matrix.target }}" == "jdcloud_re-cp-03" ]; then
+            echo "CONFIG_TARGET_mediatek=y" >> .config
+            echo "CONFIG_TARGET_mediatek_mt7986=y" >> .config
+            echo "CONFIG_TARGET_mediatek_mt7986_DEVICE_jdcloud_re-cp-03=y" >> .config
+          elif [ "${{ matrix.target }}" == "cudy_tr3000-v1" ]; then
+            echo "CONFIG_TARGET_mediatek=y" >> .config
+            echo "CONFIG_TARGET_mediatek_mt7981=y" >> .config
+            echo "CONFIG_TARGET_mediatek_mt7981_DEVICE_cudy_tr3000-v1=y" >> .config
+          elif [ "${{ matrix.target }}" == "cmcc_rax3000m-emmc" ]; then
+            echo "CONFIG_TARGET_mediatek=y" >> .config
+            echo "CONFIG_TARGET_mediatek_mt7981=y" >> .config
+            echo "CONFIG_TARGET_mediatek_mt7981_DEVICE_cmcc_rax3000m-emmc=y" >> .config
+          fi
+          
+          # --- 基础插件 (所有版本共有) ---
+          echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-argon-config=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-ttyd=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-ddns=y" >> .config
+          echo "CONFIG_PACKAGE_ddns-scripts=y" >> .config
+          echo "CONFIG_PACKAGE_ddns-scripts_aliyun=y" >> .config
+          echo "CONFIG_PACKAGE_ddns-scripts_cloudflare.com-v4=y" >> .config
+          # 取消勾选默认 bootstrap
+          echo "# CONFIG_PACKAGE_luci-theme-bootstrap is not set" >> .config
+          
+          # --- 4个插件专属 (4-plugins 版本) ---
+          if [ "${{ matrix.variant }}" == "4-plugins" ]; then
+            echo "CONFIG_PACKAGE_luci-app-nikki=y" >> .config
+            echo "CONFIG_PACKAGE_luci-app-rtp2httpd=y" >> .config
+            echo "CONFIG_PACKAGE_rtp2httpd=y" >> .config
+          fi
+          
+          # 将依赖自动补全展开
+          make defconfig
+
+      - name: Download Packages (下载编译依赖)
+        working-directory: ./openwrt
+        run: |
+          make download -j8
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: Compile Firmware (编译固件)
+        working-directory: ./openwrt
+        run: |
+          echo -e "$(nproc) thread compile"
+          # 先尝试多线程编译，出错则单线程编译（显示详细报错供排错）
+          make -j$(nproc) || make -j1 || make -j1 V=s
+
+      - name: Organize Files (整理固件命名)
+        id: organize
+        run: |
+          cd openwrt/bin/targets/*/*
+          rm -rf packages
+          # 给编译出的 BIN/IMG 固件重命名，添加变体后缀 (4-plugins/2-plugins)
+          for file in *; do
+            if [[ -f "$file" ]]; then
+              ext="${file##*.}"
+              filename="${file%.*}"
+              mv "$file" "${filename}-${{ matrix.variant }}.${ext}"
+            fi
+          done
+          echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Upload Firmware to Release (发布至 Releases)
+        uses: softprops/action-gh-release@v1
+        if: steps.organize.outputs.status == 'success' && !cancelled()
+        with:
+          tag_name: ${{ matrix.target }}-${{ matrix.variant }}-Build-${{ github.run_number }}
+          files: ${{ env.FIRMWARE }}/*
