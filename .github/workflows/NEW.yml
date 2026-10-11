@@ -58,21 +58,43 @@ jobs:
 
       - name: 預置 Nikki Alpha-Smart 核心 (Custom Core)
         working-directory: ./openwrt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ "${{ matrix.variant }}" == "5-plugins" ]; then
-            echo "正在為 5-plugins 整合最新 Alpha-Smart 核心..."
+            echo "正在為 5-plugins 整合 vernesong/mihomo 最新 Alpha-Smart 核心..."
             mkdir -p files/usr/bin
 
-            # 下載最新 Smart 核心 (Vernesong Smart / Alpha 分支，arm64/aarch64)
-            SMART_URL=$(curl -sL https://api.github.com/repos/vernesong/mihomo-oix/releases | jq -r '.[0].assets[] | select(.name | test("linux-arm64.*gz$\vert{}linux-armv8.*gz$")) | .browser_download_url' | head -n 1)
-            if [ -z "$SMART_URL" ]; then
-              SMART_URL="https://github.com/vernesong/mihomo-oix/releases/download/Pre-Alpha/mihomo-linux-arm64.gz"
+            # 1. 透過 GitHub API 動態查詢 Prerelease-Alpha 標籤下符合 alpha-smart 的 arm64 最新檔名與下載位址
+            SMART_URL=$(curl -sL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/vernesong/mihomo/releases/tags/Prerelease-Alpha \
+              | jq -r '.assets[] | select(.name | test("^mihomo-linux-arm64-alpha-smart-.*\\.gz$")) | .browser_download_url' | head -n 1)
+
+            # 2. 備用方案：若 API 未取到，解析 releases 網頁原始碼提取包含最新 Commit 雜湊的下載鏈接
+            if [ -z "$SMART_URL" ] || [ "$SMART_URL" = "null" ]; then
+              echo "API 匹配失敗，嘗試從 Release 頁面提取最新檔案鏈接..."
+              SMART_URL=$(curl -sL https://github.com/vernesong/mihomo/releases/expanded_assets/Prerelease-Alpha \
+                | grep -oE '/vernesong/mihomo/releases/download/Prerelease-Alpha/mihomo-linux-arm64-alpha-smart-[a-zA-Z0-9]+\.gz' \
+                | head -n 1)
+              if [ -n "$SMART_URL" ]; then
+                SMART_URL="https://github.com${SMART_URL}"
+              fi
             fi
-            echo "下載 Alpha-Smart 核心: $SMART_URL"
+
+            # 3. 檢查並執行下載與解壓
+            if [ -z "$SMART_URL" ] || [ "$SMART_URL" = "null" ]; then
+              echo "錯誤：未找到符合的 alpha-smart arm64 核心下載地址！"
+              exit 1
+            fi
+
+            echo "下載 Alpha-Smart 核心位址: $SMART_URL"
             curl -fsSL -o /tmp/mihomo-smart.gz "$SMART_URL"
-            gzip -d /tmp/mihomo-smart.gz
+            gzip -d -f /tmp/mihomo-smart.gz
             mv /tmp/mihomo-smart files/usr/bin/mihomo
             chmod +x files/usr/bin/mihomo
+            echo "Nikki Alpha-Smart 核心安裝完成！"
           fi
 
       - name: 自動生成編譯設定 (Generate .config)
