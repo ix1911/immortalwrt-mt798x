@@ -1,4 +1,4 @@
-name: 編譯 ImmortalWrt (純淨官方 v25.12.x 最新版)
+name: 編譯 ImmortalWrt (純淨官方滾動主線)
 
 on:
   workflow_dispatch: # 支援在 Actions 頁面手動觸發建置
@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    name: 建置 ${{ matrix.target }} - ${{ matrix.variant }}
+    name: 建置 ${{ matrix.target }} -${{ matrix.variant }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write  # 允許腳本建立和寫入 Release
@@ -35,10 +35,10 @@ jobs:
           # 設定時區為台北時間
           sudo timedatectl set-timezone "Asia/Taipei"
 
-      - name: 拉取 ImmortalWrt 官方最新原始碼 (Clone Official Source)
+      - name: 拉取 ImmortalWrt 官方最新主線原始碼 (Clone Master Branch)
         run: |
-          # 核心修改：徹底排除 padavanonly，直接拉取官方 openwrt-25.12 穩定分支 (對應 v25.12.2)
-          git clone -b openwrt-25.12 --single-branch --depth 1 https://github.com/immortalwrt/immortalwrt openwrt
+          # 預設拉取官方最前沿的 master 主線 (Rolling Release)
+          git clone --depth 1 https://github.com/immortalwrt/immortalwrt openwrt
           cd openwrt
           
           # 獲取官方原始碼最新更新時間 (格式：YYYYMMDD)
@@ -50,7 +50,6 @@ jobs:
         working-directory: ./openwrt
         run: |
           # 1. 引入 Nikki 軟體來源
-          # (Nikki 的 main 分支原生基於 nftables/firewall4 開發，與 v25.12.2 系統完美相容)
           echo "src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main" >> feeds.conf.default
           
           # 2. 引入 rtp2httpd (官方手動整合模式)
@@ -60,7 +59,7 @@ jobs:
           mv package/rtp2httpd/Makefile.versioned package/rtp2httpd/Makefile
           mv package/luci-app-rtp2httpd/Makefile.versioned package/luci-app-rtp2httpd/Makefile
 
-          # 3. 更新並安裝所有官方 feeds (這會自動匹配 25.12 版本的所有依賴和介面組件)
+          # 3. 更新並安裝所有官方 feeds 
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           
@@ -74,7 +73,6 @@ jobs:
           touch .config
           
           # --- 目標設備 (Target) ---
-          # 官方主線中，MT798x 平台統一歸類在 filogic 目錄下
           if [ "${{ matrix.target }}" == "jdcloud_re-cp-03" ]; then
             echo "CONFIG_TARGET_mediatek=y" >> .config
             echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
@@ -110,7 +108,6 @@ jobs:
             echo "CONFIG_PACKAGE_rtp2httpd=y" >> .config
           fi
           
-          # 補全官方所有相依性 (自動包含 firewall4 相關設定)
           make defconfig
 
       - name: 下載編譯依賴套件 (Download Packages)
@@ -124,26 +121,32 @@ jobs:
         working-directory: ./openwrt
         run: |
           echo -e "$(nproc) thread compile"
-          # 先嘗試多執行緒編譯，出錯則單執行緒編譯以便排錯
           make -j$(nproc) || make -j1 || make -j1 V=s
 
-      - name: 整理韌體命名 (Organize Files)
+      - name: 整理韌體命名與版本號淨化 (Organize Files & Clean Version)
         id: organize
         run: |
-          # 從官方原始碼精準提取目前版本號 (如 25.12.2)
           cd openwrt
-          IMG_VERSION=$(grep -Po 'VERSION_NUMBER:=\K.*' include/version.mk || echo "SNAPSHOT")
+          
+          # 安全提取版本號：過濾掉動態變數，只精準提取數字版本號 (如 25.12) 
+          RAW_VERSION=$(grep 'VERSION_NUMBER:=' include/version.mk || true)
+          IMG_VERSION=$(echo "$RAW_VERSION" | grep -oE '[0-9]+\.[0-9]+[^ ,)]*' | head -n 1)
+          
+          # 若提取失敗，預設給予 SNAPSHOT 標識
+          if [ -z "$IMG_VERSION" ]; then
+            IMG_VERSION="SNAPSHOT"
+          fi
+          
+          echo "解析到的安全版本號為: $IMG_VERSION"
           echo "IMG_VERSION=$IMG_VERSION" >> $GITHUB_ENV
           
           cd bin/targets/*/*
           rm -rf packages
           
-          # 遍歷重命名
           for file in *; do
             if [[ -f "$file" ]]; then
               ext="${file##*.}"
               filename="${file%.*}"
-              # 最終檔名：系統名-v版本號-更新時間-外掛組合.副檔名
               mv "$file" "${filename}-v${IMG_VERSION}-${{ env.UPSTREAM_DATE }}-${{ matrix.variant }}.${ext}"
             fi
           done
@@ -151,10 +154,39 @@ jobs:
           echo "FIRMWARE=$PWD" >> $GITHUB_ENV
           echo "status=success" >> $GITHUB_OUTPUT
 
+      - name: 產生發布說明文件 (Generate Release Notes)
+        run: |
+          echo "## 🚀 ImmortalWrt 官方韌體自動編譯發布" > release_notes.md
+          echo "- **目標設備**: \`${{ matrix.target }}\`" >> release_notes.md
+          echo "- **底層版本**: \`v${{ env.IMG_VERSION }}\` (官方最新主線)" >> release_notes.md
+          echo "- **編譯時間**: \`${{ env.UPSTREAM_DATE }}\`" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "### 📦 預裝外掛與組件清單" >> release_notes.md
+          echo "本韌體預設已整合 **Argon 主題 (luci-theme-argon)** 與 **SFTP 伺服端 (openssh-sftp-server)**。" >> release_notes.md
+          echo "" >> release_notes.md
+          
+          if [ "${{ matrix.variant }}" == "3-plugins" ]; then
+            echo "#### 🟢 基礎精簡版 (3-plugins)" >> release_notes.md
+            echo "包含以下核心外掛，適合追求極致穩定的使用者：" >> release_notes.md
+            echo "1. **TTYD 終端機** (\`luci-app-ttyd\`)" >> release_notes.md
+            echo "2. **DDNS 動態域名** (包含阿里雲、Cloudflare 支援腳本)" >> release_notes.md
+          elif [ "${{ matrix.variant }}" == "5-plugins" ]; then
+            echo "#### 🔴 全功能高階版 (5-plugins)" >> release_notes.md
+            echo "在基礎版之上，額外新增以下進階網路外掛：" >> release_notes.md
+            echo "1. **TTYD 終端機** (\`luci-app-ttyd\`)" >> release_notes.md
+            echo "2. **DDNS 動態域名** (包含阿里雲、Cloudflare 支援腳本)" >> release_notes.md
+            echo "3. **Nikki 代理** (\`luci-app-nikki\`，完美適配官方 nftables/firewall4 架構)" >> release_notes.md
+            echo "4. **RTP2HTTPD** (IPTV 組播轉 HTTP 轉發，採用官方手動整合模式)" >> release_notes.md
+          fi
+          
+          echo "" >> release_notes.md
+          echo "> 💡 *此頁面與韌體由 GitHub Actions 依據配置全自動化建置。*" >> release_notes.md
+
       - name: 發布至 Releases (Upload Firmware to Release)
         uses: softprops/action-gh-release@v1
         if: steps.organize.outputs.status == 'success' && !cancelled()
         with:
-          # 發佈標籤會自動帶入官方抓取到的最新版本號 (v25.12.2) 與更新時間
           tag_name: ${{ matrix.target }}-v${{ env.IMG_VERSION }}-${{ env.UPSTREAM_DATE }}-${{ matrix.variant }}-Build-${{ github.run_number }}
+          name: 韌體下載: ${{ matrix.target }} - v${{ env.IMG_VERSION }} (${{ matrix.variant }})
+          body_path: release_notes.md
           files: ${{ env.FIRMWARE }}/*
