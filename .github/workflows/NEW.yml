@@ -56,23 +56,24 @@ jobs:
           # 4. 預設主題維持純淨 Argon
           sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' feeds/luci/collections/luci/Makefile
 
-      - name: 預置 Nikki Alpha-Smart 核心 (Custom Core)
+      - name: 預置 Nikki Alpha-Smart 核心並進行 UPX 壓縮 (Custom Core & UPX)
         working-directory: ./openwrt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ "${{ matrix.variant }}" == "5-plugins" ]; then
             echo "正在為 5-plugins 整合 vernesong/mihomo 最新 Alpha-Smart 核心..."
-            mkdir -p files/usr/bin
+            # 建立真正的核心存放路徑
+            mkdir -p files/usr/libexec
 
-            # 1. 透過 GitHub API 動態查詢 Prerelease-Alpha 標籤下符合 alpha-smart 的 arm64 最新檔名與下載位址
+            # 1. 動態匹配下載最新 arm64-alpha-smart 核心
             SMART_URL=$(curl -sL \
               -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer $GH_TOKEN" \
               https://api.github.com/repos/vernesong/mihomo/releases/tags/Prerelease-Alpha \
               | jq -r '.assets[] | select(.name | test("^mihomo-linux-arm64-alpha-smart-.*\\.gz$")) | .browser_download_url' | head -n 1)
 
-            # 2. 備用方案：若 API 未取到，解析 releases 網頁原始碼提取包含最新 Commit 雜湊的下載鏈接
+            # 備用容錯解析
             if [ -z "$SMART_URL" ] || [ "$SMART_URL" = "null" ]; then
               echo "API 匹配失敗，嘗試從 Release 頁面提取最新檔案鏈接..."
               SMART_URL=$(curl -sL https://github.com/vernesong/mihomo/releases/expanded_assets/Prerelease-Alpha \
@@ -83,7 +84,6 @@ jobs:
               fi
             fi
 
-            # 3. 檢查並執行下載與解壓
             if [ -z "$SMART_URL" ] || [ "$SMART_URL" = "null" ]; then
               echo "錯誤：未找到符合的 alpha-smart arm64 核心下載地址！"
               exit 1
@@ -92,9 +92,16 @@ jobs:
             echo "下載 Alpha-Smart 核心位址: $SMART_URL"
             curl -fsSL -o /tmp/mihomo-smart.gz "$SMART_URL"
             gzip -d -f /tmp/mihomo-smart.gz
-            mv /tmp/mihomo-smart files/usr/bin/mihomo
-            chmod +x files/usr/bin/mihomo
-            echo "Nikki Alpha-Smart 核心安裝完成！"
+
+            # 2. 使用 UPX -9 進行極限壓縮
+            echo "正在執行 UPX 壓縮..."
+            chmod +x /tmp/mihomo-smart
+            upx -9 /tmp/mihomo-smart || echo "UPX 壓縮警告：若核心已加殼或不支援將略過，直接使用原二進位"
+
+            # 3. 部署到正確的真實路徑 /usr/libexec/mihomo
+            mv /tmp/mihomo-smart files/usr/libexec/mihomo
+            chmod +x files/usr/libexec/mihomo
+            echo "Nikki Alpha-Smart 核心部署與壓縮完成！"
           fi
 
       - name: 自動生成編譯設定 (Generate .config)
