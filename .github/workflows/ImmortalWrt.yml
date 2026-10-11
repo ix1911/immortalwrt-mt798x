@@ -187,6 +187,6 @@ jobs:
         if: steps.organize.outputs.status == 'success' && !cancelled()
         with:
           tag_name: ${{ matrix.target }}-v${{ env.IMG_VERSION }}-${{ env.UPSTREAM_DATE }}-${{ matrix.variant }}-Build-${{ github.run_number }}
-          name: 韌體下載: ${{ matrix.target }} - v${{ env.IMG_VERSION }} (${{ matrix.variant }})
+          name: "韌體下載: ${{ matrix.target }} - v${{ env.IMG_VERSION }} (${{ matrix.variant }})"
           body_path: release_notes.md
           files: ${{ env.FIRMWARE }}/*
