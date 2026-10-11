@@ -1,28 +1,28 @@
-name: Build ImmortalWrt (Padavanonly Closed-Source)
+name: Build ImmortalWrt (Padavanonly 閉源驅動)
 
 on:
-  workflow_dispatch: # 支持在 Actions 页面手动触发构建
+  workflow_dispatch: # 支援在 Actions 頁面手動觸發建置
   # push:
   #   branches:
-  #     - main # 如果希望每次提交代码时自动触发，可取消此段注释
+  #     - main # 若希望每次提交程式碼時自動觸發，可取消此段註解
 
 jobs:
   build:
     name: Build ${{ matrix.target }} - ${{ matrix.variant }}
     runs-on: ubuntu-22.04
     permissions:
-      contents: write  # 明确声明允许此脚本创建和写入 Release 
+      contents: write  # 明確聲明允許此腳本建立和寫入 Release
     strategy:
       fail-fast: false
       matrix:
         target: [jdcloud_re-cp-03, cudy_tr3000-v1, cmcc_rax3000m-emmc]
-        variant: [5-plugins, 3-plugins] # 变体升级：原4个改5个，原2个改3个
+        variant: [5-plugins, 3-plugins] # 變體升級：原4個改5個，原2個改3個
 
     steps:
-      - name: Checkout Code
+      - name: Checkout Code (檢出程式碼)
         uses: actions/checkout@v3
 
-      - name: Initialize Environment (初始化编译环境)
+      - name: Initialize Environment (初始化編譯環境)
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -32,56 +32,49 @@ jobs:
           sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
           sudo -E apt-get -qq autoremove --purge
           sudo -E apt-get -qq clean
-          sudo timedatectl set-timezone "Asia/Shanghai"
+          # 設定時區為台北時間
+          sudo timedatectl set-timezone "Asia/Taipei"
 
-      - name: Clone Source Code & Get Update Time (拉取固件源码及更新时间)
+      - name: Clone Source Code & Get Update Time (拉取原始碼與獲取更新時間)
         run: |
-          # 克隆 padavanonly 的 immortalwrt-mt798x 源码分支
+          # 複製 padavanonly 的 immortalwrt-mt798x 原始碼分支
           git clone --depth 1 https://github.com/padavanonly/immortalwrt-mt798x openwrt
           cd openwrt
           
-          # 获取当前上游源码最新一次 Commit 的时间 (格式：YYYYMMDD，例如 20261003)
+          # 獲取目前上游原始碼最新一次 Commit 的時間 (格式：YYYYMMDD，例如 20261003)
           UPSTREAM_DATE=$(git log -1 --format="%cd" --date=format:"%Y%m%d")
-          echo "获取到上游源码更新时间: $UPSTREAM_DATE"
+          echo "獲取到上游原始碼更新時間: $UPSTREAM_DATE"
           
-          # 存入全局环境变量，供后续文件名拼接使用
+          # 存入全域環境變數，供後續檔案名稱拼接使用
           echo "UPSTREAM_DATE=$UPSTREAM_DATE" >> $GITHUB_ENV
 
-      - name: Install Extra Feeds & Plugins (安装外部插件源)
+      - name: Install Extra Feeds & Plugins (安裝外部擴充套件來源)
         working-directory: ./openwrt
         run: |
-          # 1. 先更新系统默认 feeds 列表
-          ./scripts/feeds update -a
+          # 1. 引入 Nikki 軟體來源 (使用最新官方倉庫地址和主分支)
+          echo "src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main" >> feeds.conf.default
           
-          # 2. 暴力提取：直接从 ImmortalWrt 官方主线提取最新的 Nikki (应对原作者删库/转私有)
-          git clone --depth 1 https://github.com/immortalwrt/packages.git /tmp/im-packages
-          git clone --depth 1 https://github.com/immortalwrt/luci.git /tmp/im-luci
-          # 删除原有 feeds 中可能存在的旧版 nikki，防止编译时版本冲突
-          rm -rf feeds/packages/net/nikki feeds/luci/applications/luci-app-nikki
-          # 将提取出来的最新 nikki 源码直接放入本地 package 目录 (优先级最高)
-          cp -r /tmp/im-packages/net/nikki package/nikki
-          cp -r /tmp/im-luci/applications/luci-app-nikki package/luci-app-nikki
-          
-          # 3. 引入 rtp2httpd (官方手动集成模式)
+          # 2. 引入 rtp2httpd (官方手動整合模式)
           git clone --depth 1 https://github.com/stackia/rtp2httpd /tmp/rtp2httpd
           cp -r /tmp/rtp2httpd/openwrt-support/luci-app-rtp2httpd package/luci-app-rtp2httpd
           cp -r /tmp/rtp2httpd/openwrt-support/rtp2httpd package/rtp2httpd
           mv package/rtp2httpd/Makefile.versioned package/rtp2httpd/Makefile
           mv package/luci-app-rtp2httpd/Makefile.versioned package/luci-app-rtp2httpd/Makefile
 
-          # 4. 安装所有组件
+          # 3. 更新並安裝所有 feeds
+          ./scripts/feeds update -a
           ./scripts/feeds install -a
           
-          # 5. 修改默认主题为 Argon
+          # 4. 修改預設主題為 Argon
           sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' feeds/luci/collections/luci/Makefile
 
-      - name: Generate .config (自动生成编译配置)
+      - name: Generate .config (自動生成編譯設定)
         working-directory: ./openwrt
         run: |
           rm -f .config
           touch .config
           
-          # --- 目标设备 (Target) ---
+          # --- 目標設備 (Target) ---
           if [ "${{ matrix.target }}" == "jdcloud_re-cp-03" ]; then
             echo "CONFIG_TARGET_mediatek=y" >> .config
             echo "CONFIG_TARGET_mediatek_mt7986=y" >> .config
@@ -96,69 +89,69 @@ jobs:
             echo "CONFIG_TARGET_mediatek_mt7981_DEVICE_cmcc_rax3000m-emmc=y" >> .config
           fi
           
-          # --- 基础插件 (3-plugins 所有版本共有) ---
-          # 界面与主题
+          # --- 基礎插件 (3-plugins 所有版本共有) ---
+          # 介面與主題
           echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-argon-config=y" >> .config
           # TTYD
           echo "CONFIG_PACKAGE_luci-app-ttyd=y" >> .config
-          # DDNS 脚本
+          # DDNS 腳本
           echo "CONFIG_PACKAGE_luci-app-ddns=y" >> .config
           echo "CONFIG_PACKAGE_ddns-scripts=y" >> .config
           echo "CONFIG_PACKAGE_ddns-scripts_aliyun=y" >> .config
           echo "CONFIG_PACKAGE_ddns-scripts_cloudflare.com-v4=y" >> .config
-          # 【新增】SFTP 服务端 (为了满足 3-plugins 改 4-plugins 的需求)
+          # 【新增】SFTP 伺服端
           echo "CONFIG_PACKAGE_openssh-sftp-server=y" >> .config
           
-          # 取消勾选默认 bootstrap 主题
+          # 取消勾選預設 bootstrap 主題
           echo "# CONFIG_PACKAGE_luci-theme-bootstrap is not set" >> .config
           
-          # --- 5个插件专属 (5-plugins 版本额外追加) ---
+          # --- 5個插件專屬 (5-plugins 版本額外追加) ---
           if [ "${{ matrix.variant }}" == "5-plugins" ]; then
             # Nikki 代理
             echo "CONFIG_PACKAGE_luci-app-nikki=y" >> .config
-            # rtp2httpd 组播转发
+            # rtp2httpd 組播轉發
             echo "CONFIG_PACKAGE_luci-app-rtp2httpd=y" >> .config
             echo "CONFIG_PACKAGE_rtp2httpd=y" >> .config
           fi
           
-          # 将依赖自动补全展开
+          # 將依賴自動補全展開
           make defconfig
 
-      - name: Download Packages (下载编译依赖)
+      - name: Download Packages (下載編譯依賴套件)
         working-directory: ./openwrt
         run: |
           make download -j8
           find dl -size -1024c -exec ls -l {} \;
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: Compile Firmware (编译固件)
+      - name: Compile Firmware (編譯韌體)
         working-directory: ./openwrt
         run: |
           echo -e "$(nproc) thread compile"
-          # 先尝试多线程编译，出错则单线程编译（显示详细报错供排错）
+          # 先嘗試多執行緒編譯，出錯則單執行緒編譯（顯示詳細報錯供排錯）
           make -j$(nproc) || make -j1 || make -j1 V=s
 
-      - name: Organize Files (提取版本号并整理固件命名)
+      - name: Organize Files (提取版本號並整理韌體命名)
         id: organize
         run: |
-          # 1. 从源码的 version.mk 文件中精准提取 ImmortalWrt 版本号
+          # 1. 從原始碼的 version.mk 檔案中精準提取 ImmortalWrt 版本號
           cd openwrt
           IMG_VERSION=$(grep -Po 'VERSION_NUMBER:=\K.*' include/version.mk || echo "SNAPSHOT")
           
-          # 将提取到的版本号存入全局环境变量
+          # 將提取到的版本號存入全域環境變數
           echo "IMG_VERSION=$IMG_VERSION" >> $GITHUB_ENV
           
-          # 2. 进入固件最终生成的输出目录
+          # 2. 進入韌體最終生成的輸出目錄
           cd bin/targets/*/*
           rm -rf packages
           
-          # 3. 遍历所有生成的 bin/img 固件并进行重命名拼接
+          # 3. 遍歷所有生成的 bin/img 韌體並進行重命名拼接
           for file in *; do
             if [[ -f "$file" ]]; then
               ext="${file##*.}"
               filename="${file%.*}"
-              # 最终文件名格式：原系统名-v版本号-上游更新时间-插件组合.后缀
+              # 最終檔案名稱格式：原系統名-v版本號-上游更新時間-外掛組合.副檔名
               # 例如：immortalwrt-mediatek-mt7981-cudy_tr3000-v1-squashfs-sysupgrade-v23.05.4-20261003-5-plugins.bin
               mv "$file" "${filename}-v${IMG_VERSION}-${{ env.UPSTREAM_DATE }}-${{ matrix.variant }}.${ext}"
             fi
@@ -167,10 +160,10 @@ jobs:
           echo "FIRMWARE=$PWD" >> $GITHUB_ENV
           echo "status=success" >> $GITHUB_OUTPUT
 
-      - name: Upload Firmware to Release (发布至 Releases)
+      - name: Upload Firmware to Release (發布至 Releases)
         uses: softprops/action-gh-release@v1
         if: steps.organize.outputs.status == 'success' && !cancelled()
         with:
-          # 让 Release 的发布标签（Tag）也带上版本号和更新时间
+          # 讓 Release 的發布標籤（Tag）也帶上版本號和更新時間
           tag_name: ${{ matrix.target }}-v${{ env.IMG_VERSION }}-${{ env.UPSTREAM_DATE }}-${{ matrix.variant }}-Build-${{ github.run_number }}
           files: ${{ env.FIRMWARE }}/*
