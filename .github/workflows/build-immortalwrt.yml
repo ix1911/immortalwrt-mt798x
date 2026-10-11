@@ -10,6 +10,8 @@ jobs:
   build:
     name: Build ${{ matrix.target }} - ${{ matrix.variant }}
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write  # 明确声明允许此脚本创建和写入 Release 
     strategy:
       fail-fast: false
       matrix:
