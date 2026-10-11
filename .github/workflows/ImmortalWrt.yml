@@ -1,4 +1,4 @@
-name: 編譯 ImmortalWrt (純淨官方滾動主線)
+name: ImmortalWrt (純淨官方滾動主線)
 
 on:
   workflow_dispatch: # 支援在 Actions 頁面手動觸發建置
