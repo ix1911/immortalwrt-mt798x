@@ -1,4 +1,4 @@
-name: 編譯 ImmortalWrt (永遠追蹤官方最新主線)
+name: 編譯 ImmortalWrt (純淨官方 v25.12.x 最新版)
 
 on:
   workflow_dispatch: # 支援在 Actions 頁面手動觸發建置
@@ -35,11 +35,10 @@ jobs:
           # 設定時區為台北時間
           sudo timedatectl set-timezone "Asia/Taipei"
 
-      - name: 拉取 ImmortalWrt 官方最新主線原始碼 (Clone Master Branch)
+      - name: 拉取 ImmortalWrt 官方最新原始碼 (Clone Official Source)
         run: |
-          # 核心修改：不指定任何分支，預設拉取官方最前沿的 master 主線 (Rolling Release)
-          # 這保證了每一次編譯，都是抓取當下最新的原始碼、最新的核心架構
-          git clone --depth 1 https://github.com/immortalwrt/immortalwrt openwrt
+          # 核心修改：徹底排除 padavanonly，直接拉取官方 openwrt-25.12 穩定分支 (對應 v25.12.2)
+          git clone -b openwrt-25.12 --single-branch --depth 1 https://github.com/immortalwrt/immortalwrt openwrt
           cd openwrt
           
           # 獲取官方原始碼最新更新時間 (格式：YYYYMMDD)
@@ -51,7 +50,7 @@ jobs:
         working-directory: ./openwrt
         run: |
           # 1. 引入 Nikki 軟體來源
-          # (Nikki 的 main 分支原生基於 nftables/firewall4 開發，與官方主線完美相容)
+          # (Nikki 的 main 分支原生基於 nftables/firewall4 開發，與 v25.12.2 系統完美相容)
           echo "src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main" >> feeds.conf.default
           
           # 2. 引入 rtp2httpd (官方手動整合模式)
@@ -61,8 +60,7 @@ jobs:
           mv package/rtp2httpd/Makefile.versioned package/rtp2httpd/Makefile
           mv package/luci-app-rtp2httpd/Makefile.versioned package/luci-app-rtp2httpd/Makefile
 
-          # 3. 更新並安裝所有官方 feeds 
-          # (因為底層是 master，這裡也會自動拉取所有附屬倉庫的最前沿代碼，確保外掛與介面永遠最新)
+          # 3. 更新並安裝所有官方 feeds (這會自動匹配 25.12 版本的所有依賴和介面組件)
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           
@@ -132,7 +130,7 @@ jobs:
       - name: 整理韌體命名 (Organize Files)
         id: organize
         run: |
-          # 從主線原始碼中提取目前定義的版本號 (主線版本號會不斷變化，如 SNAPSHOT 或未來的大版本號)
+          # 從官方原始碼精準提取目前版本號 (如 25.12.2)
           cd openwrt
           IMG_VERSION=$(grep -Po 'VERSION_NUMBER:=\K.*' include/version.mk || echo "SNAPSHOT")
           echo "IMG_VERSION=$IMG_VERSION" >> $GITHUB_ENV
@@ -157,6 +155,6 @@ jobs:
         uses: softprops/action-gh-release@v1
         if: steps.organize.outputs.status == 'success' && !cancelled()
         with:
-          # 發佈標籤會自動帶入抓取到的前沿版本號與更新時間
+          # 發佈標籤會自動帶入官方抓取到的最新版本號 (v25.12.2) 與更新時間
           tag_name: ${{ matrix.target }}-v${{ env.IMG_VERSION }}-${{ env.UPSTREAM_DATE }}-${{ matrix.variant }}-Build-${{ github.run_number }}
           files: ${{ env.FIRMWARE }}/*
