@@ -1,8 +1,5 @@
 name: 編譯 PonWrt HG5382A 韌體 (雙版本)
 
-# 這個 workflow 放在你自己的倉庫即可，不要 fork pbs05/ponwrt。
-# 任務開始後會直接簽出上游最新 master。Release 發佈到本倉庫。
-
 on:
   workflow_dispatch:
 
@@ -24,13 +21,10 @@ jobs:
         flavor: [with-nikki, no-nikki]
 
     steps:
-      - name: 簽出 PonWrt 上游原始碼
+      - name: 簽出原始碼 (Checkout)
         uses: actions/checkout@v4
         with:
-          repository: pbs05/ponwrt
-          ref: master
           fetch-depth: 0
-          persist-credentials: false
 
       - name: 清理磁碟空間 (釋放容量)
         run: |
@@ -39,22 +33,10 @@ jobs:
             /opt/hostedtoolcache
           sudo docker system prune -af || true
           sudo apt-get clean
-          # /swapfile 若已被 runner 占用，fallocate/dd 会报 Text file busy。
-          # swap 只是防 OOM，失败不能让整个编译退出。
-          if swapon --show | awk 'NR>1 {print $1}' | grep -qx '/swapfile'; then
-            echo ">>> /swapfile 已在使用，跳过创建"
-          else
-            sudo swapoff /swapfile 2>/dev/null || true
-            sudo rm -f /swapfile || true
-            if sudo fallocate -l 8G /swapfile 2>/dev/null \
-              || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none; then
-              sudo chmod 600 /swapfile
-              sudo mkswap /swapfile
-              sudo swapon /swapfile || echo "::warning::swapon 失败，继续编译"
-            else
-              echo "::warning::无法创建 /swapfile（Text file busy 或其他原因），继续编译"
-            fi
-          fi
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
           free -h
           df -h
 
@@ -178,7 +160,7 @@ jobs:
           export GO111MODULE=on
           make download -j"$(nproc)"
           # 不要刪除 go-mod-cache 裡的小檔；只清失敗的套件 tarball
-          find dl -path 'dl/go-mod-cache' -prune -o -type f -size -1024c -print -delete
+          find dl -type f -size -1024c ! -path 'dl/go-mod-cache/*' -delete
 
       - name: 執行韌體編譯 (Compile Firmware)
         run: |
