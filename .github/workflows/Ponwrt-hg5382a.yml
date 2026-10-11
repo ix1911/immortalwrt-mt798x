@@ -1,0 +1,375 @@
+name: 編譯 PonWrt HG5382A 韌體 (雙版本)
+
+# 這個 workflow 放在你自己的倉庫即可，不要 fork pbs05/ponwrt。
+# 任務開始後會直接簽出上游最新 master。Release 發佈到本倉庫。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-hg5382a-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 編譯韌體 (${{ matrix.flavor }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [with-nikki, no-nikki]
+
+    steps:
+      - name: 簽出 PonWrt 上游原始碼
+        uses: actions/checkout@v4
+        with:
+          repository: pbs05/ponwrt
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 清理磁碟空間 (釋放容量)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup \
+            /opt/hostedtoolcache
+          sudo docker system prune -af || true
+          sudo apt-get clean
+          # /swapfile 若已被 runner 占用，fallocate/dd 会报 Text file busy。
+          # swap 只是防 OOM，失败不能让整个编译退出。
+          if swapon --show | awk 'NR>1 {print $1}' | grep -qx '/swapfile'; then
+            echo ">>> /swapfile 已在使用，跳过创建"
+          else
+            sudo swapoff /swapfile 2>/dev/null || true
+            sudo rm -f /swapfile || true
+            if sudo fallocate -l 8G /swapfile 2>/dev/null \
+              || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none; then
+              sudo chmod 600 /swapfile
+              sudo mkswap /swapfile
+              sudo swapon /swapfile || echo "::warning::swapon 失败，继续编译"
+            else
+              echo "::warning::无法创建 /swapfile（Text file busy 或其他原因），继续编译"
+            fi
+          fi
+          free -h
+          df -h
+
+      - name: 初始化編譯環境 (安裝相依套件)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply python3-pyelftools \
+            python3-setuptools qemu-utils re2c rsync scons squashfs-tools \
+            subversion swig texinfo uglifyjs unzip wget xmlto xxd zlib1g-dev zstd \
+            libzstd-dev jq dos2unix
+
+      - name: 加入外掛來源 (依條件注入 NIKKI)
+        run: |
+          sed -i '/nikki/d' feeds.conf.default
+          if [ "${{ matrix.flavor }}" = "with-nikki" ]; then
+            echo ">>> [with-nikki] 正在加入 NIKKI 外掛軟體源..."
+            [ -n "$(tail -c1 feeds.conf.default)" ] && echo "" >> feeds.conf.default
+            echo 'src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' >> feeds.conf.default
+            dos2unix feeds.conf.default
+          else
+            echo ">>> [no-nikki] 純淨版本，略過 NIKKI 外掛來源注入"
+          fi
+          echo "===== feeds.conf.default 末尾內容 ====="
+          tail -n 5 feeds.conf.default
+
+      - name: 快取下載套件 (Cache dl)
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: ponwrt-dl-an7581-${{ matrix.flavor }}-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          restore-keys: |
+            ponwrt-dl-an7581-${{ matrix.flavor }}-
+            ponwrt-dl-an7581-
+
+      - name: 更新並安裝外掛來源 (Feeds)
+        run: |
+          ./scripts/feeds update -a
+          if [ "${{ matrix.flavor }}" = "with-nikki" ]; then
+            if [ -d feeds/nikki ]; then
+              echo ">>> 正在從 feeds/nikki 中剔除 +yq 相依性（稍後以 CONFIG_PACKAGE_yq 顯式選中）..."
+              find feeds/nikki -name Makefile -exec sed -i -E 's/[[:space:]]*\+yq\b//g' {} +
+            fi
+          fi
+          ./scripts/feeds install -a
+
+      - name: 產生並調整韌體設定檔 (鎖定 HG5382A 與外掛)
+        run: |
+          perl ./scripts/kconfig.pl + configs/an7581.config configs/release.config > .config
+
+          sed -i '/CONFIG_TARGET_ALL_PROFILES/d' .config
+          sed -i '/CONFIG_TARGET_MULTI_PROFILE/d' .config
+          sed -i '/CONFIG_TARGET_airoha_an7581_DEVICE_/d' .config
+          sed -i '/CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_/d' .config
+
+          # heredoc 內容與本 step 其他行保持同一縮排，YAML 去縮排後行首沒有空格
+          cat >> .config << 'EOF'
+          # CONFIG_TARGET_ALL_PROFILES is not set
+          # CONFIG_TARGET_MULTI_PROFILE is not set
+          CONFIG_TARGET_airoha_an7581_DEVICE_fiberhome_hg5382a=y
+          CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_fiberhome_hg5382a=y
+
+          # === 雙版本共用外掛 1: TTYD 網頁終端機 ===
+          CONFIG_PACKAGE_ttyd=y
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
+
+          # === 雙版本共用外掛 2: DDNS 動態網域名稱 ===
+          CONFIG_PACKAGE_ddns-scripts=y
+          CONFIG_PACKAGE_ddns-scripts-services=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-bundle=y
+
+          # === 雙版本共用外掛 3: OpenSSH SFTP 伺服器 ===
+          CONFIG_PACKAGE_openssh-sftp-server=y
+          EOF
+
+          if [ "${{ matrix.flavor }}" = "with-nikki" ]; then
+            echo ">>> [with-nikki] 正在注入 NIKKI / mihomo-meta ..."
+            cat >> .config << 'EOF'
+          CONFIG_PACKAGE_mihomo-meta=y
+          CONFIG_PACKAGE_nikki=y
+          CONFIG_PACKAGE_luci-app-nikki=y
+          CONFIG_PACKAGE_luci-i18n-nikki-zh-cn=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_kmod-nft-socket=y
+          CONFIG_PACKAGE_kmod-dummy=y
+          CONFIG_PACKAGE_ip-full=y
+          CONFIG_PACKAGE_yq=y
+          EOF
+          else
+            echo ">>> [no-nikki] 顯式關閉 NIKKI ..."
+            echo "# CONFIG_PACKAGE_mihomo-meta is not set" >> .config
+            echo "# CONFIG_PACKAGE_nikki is not set" >> .config
+            echo "# CONFIG_PACKAGE_luci-app-nikki is not set" >> .config
+          fi
+
+          make defconfig
+
+          sp=$(grep -cE '^CONFIG_TARGET_airoha_an7581_DEVICE_.*=y$' .config || true)
+          if [ "$sp" -ne 1 ] || ! grep -q '^CONFIG_TARGET_airoha_an7581_DEVICE_fiberhome_hg5382a=y$' .config; then
+            echo "::error::HG5382A 單一機型鎖定校驗失敗！請檢查 target 設定。"
+            exit 1
+          fi
+
+      - name: 下載原始碼套件 (Download Packages)
+        run: |
+          export GOPROXY=https://proxy.golang.org,direct
+          export GO111MODULE=on
+          make download -j"$(nproc)"
+          # 不要刪除 go-mod-cache 裡的小檔；只清失敗的套件 tarball
+          find dl -path 'dl/go-mod-cache' -prune -o -type f -size -1024c -print -delete
+
+      - name: 執行韌體編譯 (Compile Firmware)
+        run: |
+          export GOPROXY=https://proxy.golang.org,direct
+          export GOSUMDB=sum.golang.org
+          export GO111MODULE=on
+          export GOENV=off
+          export GOTOOLCHAIN=local
+
+          if [ "${{ matrix.flavor }}" = "with-nikki" ]; then
+            echo ">>> 丟棄可能不完整的 Go module 快取後，單獨編譯 mihomo-meta"
+            rm -rf dl/go-mod-cache
+            mkdir -p dl/go-mod-cache
+
+            if [ ! -d package/feeds/packages/golang ]; then
+              echo "::error::找不到 package/feeds/packages/golang，無法編譯 host Go。"
+              exit 1
+            fi
+
+            make -j"$(nproc)" package/feeds/packages/golang/host/compile \
+              || make -j1 V=s package/feeds/packages/golang/host/compile
+
+            make -j1 V=s package/feeds/nikki/mihomo-meta/prepare
+
+            GO_BIN="staging_dir/hostpkg/bin/go"
+            if [ ! -x "$GO_BIN" ]; then
+              echo "::error::找不到 host go：$GO_BIN"
+              exit 1
+            fi
+            "$GO_BIN" version
+
+            PKG_DIR="$(find build_dir -type f -path '*/mihomo-meta-*/go.mod' -printf '%h\n' | head -n1)"
+            if [ -z "$PKG_DIR" ]; then
+              echo "::error::找不到 mihomo-meta 源碼目錄"
+              exit 1
+            fi
+            echo ">>> mihomo-meta 源碼：$PKG_DIR"
+
+            # 錯誤 "no required module provides package ..." 表示主模組的構建列表
+            # 沒有提供這些依賴。必須用 host go、並把模組下載進 dl/go-mod-cache
+            # （OpenWrt 的 GOMODCACHE），不能在 Makefile 的 Build/Prepare 裡盲跑 go。
+            (
+              cd "$PKG_DIR"
+              export GOMODCACHE="$GITHUB_WORKSPACE/dl/go-mod-cache"
+              export GOCACHE="$GITHUB_WORKSPACE/dl/go-build-cache"
+              export CGO_ENABLED=0
+              mkdir -p "$GOMODCACHE" "$GOCACHE"
+              "$GITHUB_WORKSPACE/$GO_BIN" get github.com/sina-ghaderi/rabbitio/subtle
+              "$GITHUB_WORKSPACE/$GO_BIN" get github.com/metacubex/sing/common/random
+              "$GITHUB_WORKSPACE/$GO_BIN" get github.com/metacubex/nftables@latest
+              "$GITHUB_WORKSPACE/$GO_BIN" mod tidy
+              "$GITHUB_WORKSPACE/$GO_BIN" mod download
+            )
+
+            make -j1 V=s package/feeds/nikki/mihomo-meta/compile
+          fi
+
+          make -j"$(nproc)" || make -j1 V=s
+
+      - name: 整理產物與重新命名 (納入版本及上游日期)
+        run: |
+          mkdir -p ./firmware_out
+
+          find bin/targets/airoha/an7581/ -type f \
+            \( -iname '*hg5382a*' -o -name '*.buildinfo' -o -name 'profiles.json' \) \
+            -exec cp -f {} ./firmware_out/ \;
+
+          UPSTREAM_DATE=$(git log -1 --format='%cd' --date=format:'%Y%m%d' -- . ':!.github' 2>/dev/null || true)
+          [ -z "$UPSTREAM_DATE" ] && UPSTREAM_DATE=$(git log -1 --format='%cd' --date=format:'%Y%m%d')
+          IMWT_VER="25.2"
+          flavor_tag="${{ matrix.flavor }}-${IMWT_VER}-${UPSTREAM_DATE}"
+          echo ">>> 上游日期=$UPSTREAM_DATE 版本=$IMWT_VER 標籤=$flavor_tag"
+
+          shopt -s nullglob
+          for file in ./firmware_out/*; do
+            [ -f "$file" ] || continue
+            base=$(basename "$file")
+            case "$base" in
+              *hg5382a*.bin|*hg5382a*.ubi|*hg5382a*.itb|*HG5382A*.bin|*HG5382A*.ubi|*HG5382A*.itb)
+                new_base="${base//hg5382a/hg5382a-${flavor_tag}}"
+                new_base="${new_base//HG5382A/HG5382A-${flavor_tag}}"
+                if [ "$base" != "$new_base" ]; then
+                  echo "重新命名: $base -> $new_base"
+                  mv -f "$file" "./firmware_out/$new_base"
+                fi
+                ;;
+            esac
+          done
+
+          # buildinfo / profiles 必須帶 flavor，否則 download-artifact merge-multiple 會互相覆蓋
+          for bf in ./firmware_out/*.buildinfo; do
+            [ -f "$bf" ] || continue
+            mv -f "$bf" "${bf%.buildinfo}-${{ matrix.flavor }}.buildinfo"
+          done
+          if [ -f ./firmware_out/profiles.json ]; then
+            mv -f ./firmware_out/profiles.json "./firmware_out/profiles-${{ matrix.flavor }}.json"
+          fi
+
+          (
+            cd ./firmware_out
+            shopt -s nullglob nocaseglob
+            target_files=( *hg5382a*.bin *hg5382a*.ubi *hg5382a*.itb )
+            if [ "${#target_files[@]}" -eq 0 ]; then
+              echo "::error::firmware_out 內沒有 HG5382A 韌體映像"
+              exit 1
+            fi
+            sha256sum "${target_files[@]}" > "sha256sums-${{ matrix.flavor }}"
+            echo "===== ${{ matrix.flavor }} 產物 ====="
+            ls -lh
+          )
+
+      - name: 上傳臨時建置產物 (Upload Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: PonWrt-HG5382A-${{ matrix.flavor }}
+          path: ./firmware_out/
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: 發布至 GitHub Releases
+    needs: build
+    # 其中一個版本失敗時，仍發布已成功的那個版本
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: 下載所有建置產物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: PonWrt-HG5382A-*
+          path: ./all_firmwares
+          merge-multiple: true
+
+      - name: 列出待發布檔案清單
+        run: |
+          echo "===== 準備發布的全部韌體清單 ====="
+          find ./all_firmwares -type f -printf '%s\t%p\n' | sort -k2
+          if ! find ./all_firmwares -type f -iname '*hg5382a*' \( -name '*.bin' -o -name '*.ubi' -o -name '*.itb' \) | grep -q .; then
+            echo "::error::沒有可發布的韌體映像"
+            exit 1
+          fi
+
+      - name: 產生發布標籤與日期
+        id: tag
+        run: |
+          export TZ="Asia/Shanghai"
+          {
+            echo "release_tag=HG5382A-$(date +'%Y.%m.%d-%H%M%S')-r${{ github.run_number }}"
+            echo "release_date=$(date +'%Y-%m-%d %H:%M')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 正式發布至 GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          name: PonWrt HG5382A 雙版本固件 (${{ steps.tag.outputs.release_date }})
+          fail_on_unmatched_files: true
+          body: |
+            ### 韌體版本說明
+            本韌體適用於 **烽火 HG5382A（處理器：AN7581）**。
+            檔名格式：`*-hg5382a-<with-nikki|no-nikki>-25.2-<上游提交日期>-*`。
+
+            ---
+
+            #### 包含 NIKKI 代理版（檔名含 `with-nikki`）
+            | 類型 | 套件 | 說明 |
+            |------|------|------|
+            | 終端 | `ttyd`、`luci-app-ttyd`、簡中語言包 | 網頁終端機 |
+            | DDNS | `ddns-scripts`、`ddns-scripts-services`、`luci-app-ddns`、簡中語言包 | 動態網域 |
+            | 依賴 | `curl`、`ca-bundle`、`yq` | HTTPS、憑證、配置處理 |
+            | 檔案 | `openssh-sftp-server` | WinSCP / FileZilla |
+            | 代理核心 | `mihomo-meta`（提供 `mihomo`） | Mihomo Meta，tag `with_gvisor` |
+            | 代理插件 | `nikki`、`luci-app-nikki`、簡中語言包 | 透明代理 |
+            | 核心模組 | `kmod-nft-tproxy`、`kmod-tun`、`kmod-inet-diag`、`kmod-nft-socket`、`kmod-dummy` | TProxy / TUN |
+            | 工具 | `ip-full` | 完整 ip 命令 |
+
+            #### 純淨輕量版（檔名含 `no-nikki`）
+            | 類型 | 套件 | 說明 |
+            |------|------|------|
+            | 終端 | `ttyd`、`luci-app-ttyd`、簡中語言包 | 網頁終端機 |
+            | DDNS | `ddns-scripts`、`ddns-scripts-services`、`luci-app-ddns`、簡中語言包 | 動態網域 |
+            | 依賴 | `curl`、`ca-bundle` | HTTPS、憑證 |
+            | 檔案 | `openssh-sftp-server` | WinSCP / FileZilla |
+
+            純淨版 **沒有** `nikki`、`mihomo-meta`、`yq`，也沒有 TProxy / TUN / dummy 這些分流模組。
+
+            ---
+
+            - 編譯完成時間：${{ steps.tag.outputs.release_date }}（UTC+8）
+            - 另附 `sha256sums-*`、`*.buildinfo`、`profiles-*.json`
+          files: ./all_firmwares/*
