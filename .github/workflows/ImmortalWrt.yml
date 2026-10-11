@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    name: 建置 ${{ matrix.target }} -${{ matrix.variant }}
+    name: 建置 ${{ matrix.target }} - ${{ matrix.variant }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write  # 允許腳本建立和寫入 Release
@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: 檢出工作區程式碼 (Checkout Code)
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: 初始化編譯環境 (Initialize Environment)
         env:
@@ -40,7 +40,7 @@ jobs:
           # 預設拉取官方最前沿的 master 主線 (Rolling Release)
           git clone --depth 1 https://github.com/immortalwrt/immortalwrt openwrt
           cd openwrt
-          
+
           # 獲取官方原始碼最新更新時間 (格式：YYYYMMDD)
           UPSTREAM_DATE=$(git log -1 --format="%cd" --date=format:"%Y%m%d")
           echo "獲取到官方更新時間: $UPSTREAM_DATE"
@@ -51,7 +51,7 @@ jobs:
         run: |
           # 1. 引入 Nikki 軟體來源
           echo "src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main" >> feeds.conf.default
-          
+
           # 2. 引入 rtp2httpd (官方手動整合模式)
           git clone --depth 1 https://github.com/stackia/rtp2httpd /tmp/rtp2httpd
           cp -r /tmp/rtp2httpd/openwrt-support/luci-app-rtp2httpd package/luci-app-rtp2httpd
@@ -59,10 +59,10 @@ jobs:
           mv package/rtp2httpd/Makefile.versioned package/rtp2httpd/Makefile
           mv package/luci-app-rtp2httpd/Makefile.versioned package/luci-app-rtp2httpd/Makefile
 
-          # 3. 更新並安裝所有官方 feeds 
+          # 3. 更新並安裝所有官方 feeds
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-          
+
           # 4. 確保系統預設主題為 Argon
           sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' feeds/luci/collections/luci/Makefile
 
@@ -71,7 +71,7 @@ jobs:
         run: |
           rm -f .config
           touch .config
-          
+
           # --- 目標設備 (Target) ---
           if [ "${{ matrix.target }}" == "jdcloud_re-cp-03" ]; then
             echo "CONFIG_TARGET_mediatek=y" >> .config
@@ -86,8 +86,8 @@ jobs:
             echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
             echo "CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m-emmc=y" >> .config
           fi
-          
-          # --- 基礎外掛 (3-plugins 所有版本共有) ---
+
+          # --- 基礎外掛 (3-plugins 與 5-plugins 共有) ---
           echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-argon-config=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-ttyd=y" >> .config
@@ -97,17 +97,17 @@ jobs:
           echo "CONFIG_PACKAGE_ddns-scripts_cloudflare.com-v4=y" >> .config
           # SFTP 伺服端
           echo "CONFIG_PACKAGE_openssh-sftp-server=y" >> .config
-          
+
           # 取消勾選預設 bootstrap 主題
           echo "# CONFIG_PACKAGE_luci-theme-bootstrap is not set" >> .config
-          
-          # --- 5個插件專屬 (5-plugins 版本額外追加) ---
+
+          # --- 5-plugins 專屬額外外掛 ---
           if [ "${{ matrix.variant }}" == "5-plugins" ]; then
             echo "CONFIG_PACKAGE_luci-app-nikki=y" >> .config
             echo "CONFIG_PACKAGE_luci-app-rtp2httpd=y" >> .config
             echo "CONFIG_PACKAGE_rtp2httpd=y" >> .config
           fi
-          
+
           make defconfig
 
       - name: 下載編譯依賴套件 (Download Packages)
@@ -127,66 +127,145 @@ jobs:
         id: organize
         run: |
           cd openwrt
-          
-          # 安全提取版本號：過濾掉動態變數，只精準提取數字版本號 (如 25.12) 
-          RAW_VERSION=$(grep 'VERSION_NUMBER:=' include/version.mk || true)
-          IMG_VERSION=$(echo "$RAW_VERSION" | grep -oE '[0-9]+\.[0-9]+[^ ,)]*' | head -n 1)
-          
-          # 若提取失敗，預設給予 SNAPSHOT 標識
-          if [ -z "$IMG_VERSION" ]; then
-            IMG_VERSION="SNAPSHOT"
+
+          # ImmortalWrt master 為滾動主線，VERSION_NUMBER 預設為 SNAPSHOT
+          # 優先從 .config 讀取使用者覆寫，否則固定使用 SNAPSHOT
+          if [ -f .config ]; then
+            CFG_VER=$(grep -E '^CONFIG_VERSION_NUMBER=' .config 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
           fi
-          
-          echo "解析到的安全版本號為: $IMG_VERSION"
+          if [ -n "$CFG_VER" ] && [ "$CFG_VER" != "y" ]; then
+            IMG_VERSION="$CFG_VER"
+          else
+            # 從 version.mk 嘗試提取，失敗則使用 SNAPSHOT
+            RAW_VERSION=$(grep -E '^VERSION_NUMBER:=' include/version.mk 2>/dev/null || true)
+            IMG_VERSION=$(echo "$RAW_VERSION" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?(-[a-zA-Z0-9]+)?' | head -n 1 || true)
+            if [ -z "$IMG_VERSION" ]; then
+              IMG_VERSION="SNAPSHOT"
+            fi
+          fi
+
+          echo "解析到的版本號為: $IMG_VERSION"
           echo "IMG_VERSION=$IMG_VERSION" >> $GITHUB_ENV
-          
-          cd bin/targets/*/*
+
+          # 進入目標目錄（只取第一個匹配路徑，避免 glob 展開問題）
+          TARGET_DIR=$(find bin/targets -mindepth 2 -maxdepth 2 -type d | head -n 1)
+          if [ -z "$TARGET_DIR" ] || [ ! -d "$TARGET_DIR" ]; then
+            echo "錯誤：找不到 bin/targets 下的韌體目錄"
+            exit 1
+          fi
+          cd "$TARGET_DIR"
+          echo "韌體目錄: $PWD"
+
+          # 移除 packages 子目錄（僅保留韌體映像）
           rm -rf packages
-          
+
+          # 僅重命名常見韌體映像檔，避免破壞 sha256sums 等校驗檔
+          # 支援 .bin / .img / .itb / .gz / .tar / .tar.gz 等
           for file in *; do
-            if [[ -f "$file" ]]; then
-              ext="${file##*.}"
-              filename="${file%.*}"
-              mv "$file" "${filename}-v${IMG_VERSION}-${{ env.UPSTREAM_DATE }}-${{ matrix.variant }}.${ext}"
+            if [ -f "$file" ]; then
+              case "$file" in
+                *.bin|*.img|*.itb|*.gz|*.tar|*.ubi|*.vdi|*.vmdk|*.qcow2)
+                  # 保留原始副檔名（處理 .tar.gz 等多層副檔名）
+                  if [[ "$file" == *.tar.gz ]]; then
+                    base="${file%.tar.gz}"
+                    ext="tar.gz"
+                  else
+                    base="${file%.*}"
+                    ext="${file##*.}"
+                  fi
+                  newname="${base}-v${IMG_VERSION}-${UPSTREAM_DATE}-${{ matrix.variant }}.${ext}"
+                  echo "重命名: $file -> $newname"
+                  mv "$file" "$newname"
+                  ;;
+                *)
+                  # 保留 sha256sums、profiles.json 等原樣
+                  echo "保留原檔: $file"
+                  ;;
+              esac
             fi
           done
-          
+
+          # 重新產生 sha256sums（讓校驗檔對應新檔名）
+          if command -v sha256sum >/dev/null 2>&1; then
+            rm -f sha256sums
+            sha256sum *.{bin,img,itb,gz,tar,ubi,vdi,vmdk,qcow2} 2>/dev/null > sha256sums || true
+            # 若上面沒匹配到任何檔，至少保留空檔或跳過
+            if [ ! -s sha256sums ]; then
+              rm -f sha256sums
+            fi
+          fi
+
           echo "FIRMWARE=$PWD" >> $GITHUB_ENV
           echo "status=success" >> $GITHUB_OUTPUT
 
       - name: 產生發布說明文件 (Generate Release Notes)
         run: |
-          echo "## 🚀 ImmortalWrt 官方韌體自動編譯發布" > release_notes.md
-          echo "- **目標設備**: \`${{ matrix.target }}\`" >> release_notes.md
-          echo "- **底層版本**: \`v${{ env.IMG_VERSION }}\` (官方最新主線)" >> release_notes.md
-          echo "- **編譯時間**: \`${{ env.UPSTREAM_DATE }}\`" >> release_notes.md
-          echo "" >> release_notes.md
-          echo "### 📦 預裝外掛與組件清單" >> release_notes.md
-          echo "本韌體預設已整合 **Argon 主題 (luci-theme-argon)** 與 **SFTP 伺服端 (openssh-sftp-server)**。" >> release_notes.md
-          echo "" >> release_notes.md
-          
+          cat > release_notes.md << 'EOF'
+          ## 🚀 ImmortalWrt 官方韌體自動編譯發布
+
+          - **目標設備**: `${{ matrix.target }}`
+          - **底層版本**: `v${{ env.IMG_VERSION }}` (官方最新主線 Rolling)
+          - **編譯基準日期**: `${{ env.UPSTREAM_DATE }}`
+          - **變體**: `${{ matrix.variant }}`
+          - **建置編號**: `#${{ github.run_number }}`
+
+          ### 📦 預裝外掛與組件清單
+
+          本韌體已預設整合 **Argon 主題**（`luci-theme-argon` + `luci-app-argon-config`）與 **SFTP 伺服端**（`openssh-sftp-server`）。
+          EOF
+
+          # 根據變體追加外掛說明（使用 >> 繼續寫入）
           if [ "${{ matrix.variant }}" == "3-plugins" ]; then
-            echo "#### 🟢 基礎精簡版 (3-plugins)" >> release_notes.md
-            echo "包含以下核心外掛，適合追求極致穩定的使用者：" >> release_notes.md
-            echo "1. **TTYD 終端機** (\`luci-app-ttyd\`)" >> release_notes.md
-            echo "2. **DDNS 動態域名** (包含阿里雲、Cloudflare 支援腳本)" >> release_notes.md
+            cat >> release_notes.md << 'EOF'
+
+          #### 🟢 基礎精簡版 (3-plugins)
+
+          適合追求穩定與較小體積的使用者，預裝以下核心組件：
+
+          | 序號 | 組件 | 說明 |
+          |------|------|------|
+          | 1 | `luci-theme-argon` + `luci-app-argon-config` | 現代化 LuCI 主題與配置介面 |
+          | 2 | `luci-app-ttyd` | 瀏覽器終端機 (Web Terminal) |
+          | 3 | `luci-app-ddns` + 腳本 | 動態域名（含阿里雲、Cloudflare v4 支援） |
+          | - | `openssh-sftp-server` | SFTP 伺服端 |
+
+          EOF
           elif [ "${{ matrix.variant }}" == "5-plugins" ]; then
-            echo "#### 🔴 全功能高階版 (5-plugins)" >> release_notes.md
-            echo "在基礎版之上，額外新增以下進階網路外掛：" >> release_notes.md
-            echo "1. **TTYD 終端機** (\`luci-app-ttyd\`)" >> release_notes.md
-            echo "2. **DDNS 動態域名** (包含阿里雲、Cloudflare 支援腳本)" >> release_notes.md
-            echo "3. **Nikki 代理** (\`luci-app-nikki\`，完美適配官方 nftables/firewall4 架構)" >> release_notes.md
-            echo "4. **RTP2HTTPD** (IPTV 組播轉 HTTP 轉發，採用官方手動整合模式)" >> release_notes.md
+            cat >> release_notes.md << 'EOF'
+
+          #### 🔴 全功能高階版 (5-plugins)
+
+          在基礎版之上額外加入進階網路功能，預裝以下組件：
+
+          | 序號 | 組件 | 說明 |
+          |------|------|------|
+          | 1 | `luci-theme-argon` + `luci-app-argon-config` | 現代化 LuCI 主題與配置介面 |
+          | 2 | `luci-app-ttyd` | 瀏覽器終端機 (Web Terminal) |
+          | 3 | `luci-app-ddns` + 腳本 | 動態域名（含阿里雲、Cloudflare v4 支援） |
+          | 4 | `luci-app-nikki` | Nikki 代理（完美適配官方 nftables / firewall4） |
+          | 5 | `luci-app-rtp2httpd` + `rtp2httpd` | IPTV 組播轉 HTTP 轉發（官方手動整合模式） |
+          | - | `openssh-sftp-server` | SFTP 伺服端 |
+
+          EOF
           fi
-          
-          echo "" >> release_notes.md
-          echo "> 💡 *此頁面與韌體由 GitHub Actions 依據配置全自動化建置。*" >> release_notes.md
+
+          cat >> release_notes.md << 'EOF'
+
+          > 💡 *此頁面與韌體由 GitHub Actions 依據配置全自動化建置。*
+          > 請依裝置型號與需求選擇對應的 `3-plugins` 或 `5-plugins` 變體下載。
+          EOF
+
+          # 去掉 heredoc 產生的前導空白（可選，保持可讀性）
+          sed -i 's/^          //' release_notes.md || true
 
       - name: 發布至 Releases (Upload Firmware to Release)
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         if: steps.organize.outputs.status == 'success' && !cancelled()
         with:
           tag_name: ${{ matrix.target }}-v${{ env.IMG_VERSION }}-${{ env.UPSTREAM_DATE }}-${{ matrix.variant }}-Build-${{ github.run_number }}
           name: "韌體下載: ${{ matrix.target }} - v${{ env.IMG_VERSION }} (${{ matrix.variant }})"
           body_path: release_notes.md
           files: ${{ env.FIRMWARE }}/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # 每個 matrix 組合使用唯一 tag，避免並行寫入衝突
+          generate_release_notes: false
