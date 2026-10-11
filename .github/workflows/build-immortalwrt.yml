@@ -41,7 +41,7 @@ jobs:
         working-directory: ./openwrt
         run: |
           # 1. 引入 Nikki 软件源
-          echo "src-git nikki https://github.com/kisssssssss/luci-app-nikki" >> feeds.conf.default
+          echo "src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main" >> feeds.conf.default
           
           # 2. 引入 rtp2httpd (官方手动集成模式)
           git clone --depth 1 https://github.com/stackia/rtp2httpd /tmp/rtp2httpd
