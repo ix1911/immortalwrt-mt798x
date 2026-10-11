@@ -167,7 +167,7 @@ jobs:
         id: organize
         run: |
           cd openwrt
-          
+
           if [ -f .config ]; then
             CFG_VER=$(grep -E '^CONFIG_VERSION_NUMBER=' .config 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
           fi
@@ -185,15 +185,15 @@ jobs:
           mkdir -p ../collected_firmware
 
           PLUGIN_NUM=$(echo "${{ matrix.variant }}" | grep -oE '[0-9]+')
-          CLEAN_DEV=$(echo "${{ matrix.target }}" \vert{} sed -E 's/-(emmc\vert{}nand\vert{}nor)$//I')
+          CLEAN_DEV=$(echo "${{ matrix.target }}" | sed -E 's/-(emmc|nand|nor)$//I')
 
           cd "$TARGET_DIR"
           # 僅挑選 bin 路由器系統韌體（過濾 BL2、FIP、u-boot 等引導檔）
           for file in *.bin; do
             [ -f "$file" ] || continue
             lower_file=$(echo "$file" | tr '[:upper:]' '[:lower:]')
-            
-            if [[ "$lower_file" =~ bl2 ]] \vert{}\vert{} [[ "$lower_file" =~ fip ]] || [[ "$lower_file" =~ uboot ]] \vert{}\vert{} [[ "$lower_file" =~ u-boot ]]; then
+
+            if [[ "$lower_file" =~ bl2 ]] || [[ "$lower_file" =~ fip ]] || [[ "$lower_file" =~ uboot ]] || [[ "$lower_file" =~ u-boot ]]; then
               echo "跳過引導檔: $file"
               continue
             fi
@@ -212,7 +212,7 @@ jobs:
             fi
 
             NEW_NAME="${CLEAN_DEV}-${IMG_VERSION}-${FW_TYPE}-${PLUGIN_NUM}.bin"
-            echo "命名歸檔: $file ->$NEW_NAME"
+            echo "命名歸檔: $file -> $NEW_NAME"
             cp "$file" "$GITHUB_WORKSPACE/collected_firmware/$NEW_NAME"
           done
 
