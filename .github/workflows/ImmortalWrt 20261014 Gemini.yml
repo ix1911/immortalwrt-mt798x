@@ -40,14 +40,11 @@ jobs:
     name: 編譯 ${{ matrix.target }} -${{ matrix.variant }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-    if: >-
-      (github.event.inputs.target_filter == '' || github.event.inputs.target_filter == 'all' || github.event.inputs.target_filter == matrix.target) &&
-      (github.event.inputs.variant_filter == '' || github.event.inputs.variant_filter == 'all' || github.event.inputs.variant_filter == matrix.variant)
     strategy:
       fail-fast: false
       matrix:
-        target: [jdcloud_re-cp-03, cudy_tr3000-v1, cmcc_rax3000m-emmc]
-        variant: [5-plugins, 3-plugins]
+        target: ${{ (github.event.inputs.target_filter == '' || github.event.inputs.target_filter == 'all') && fromJSON('["jdcloud_re-cp-03", "cudy_tr3000-v1", "cmcc_rax3000m-emmc"]') || fromJSON(format('["{0}"]', github.event.inputs.target_filter)) }}
+        variant: ${{ (github.event.inputs.variant_filter == '' || github.event.inputs.variant_filter == 'all') && fromJSON('["5-plugins", "3-plugins"]') || fromJSON(format('["{0}"]', github.event.inputs.variant_filter)) }}
 
     steps:
       - name: 檢出工作區程式碼 (Checkout Code)
