@@ -1,18 +1,18 @@
-name: ImmortalWrt (20261014 Gemini優化、純淨官方滾動主線)
+name: ImmortalWrt (20261015 Gemini優化、純淨官方滾動主線)
 
 on:
   workflow_dispatch:
     inputs:
       source_branch:
-        description: '選擇 ImmortalWrt 源碼分支 (預設為官方最新穩定版 openwrt-25.12)'
+        description: '選擇源碼分支 (預設 openwrt-25.12 官方穩定版；chasey-25.12 為 MTK 閉源加速 25.12；yuzhii-mt798x-6.6-bin 為全機型原生 BIN 分支)'
         required: false
         default: 'openwrt-25.12'
         type: choice
         options:
           - openwrt-25.12
+          - chasey-25.12
+          - yuzhii-mt798x-6.6-bin
           - openwrt-24.10
-          - master
-          - mt798x-24.10-bin
       target_filter:
         description: '選擇編譯設備 (all 為全部編譯)'
         required: false
@@ -20,8 +20,8 @@ on:
         type: choice
         options:
           - all
-          - jdcloud_re-cp-03
           - cudy_tr3000-v1
+          - jdcloud_re-cp-03
           - cmcc_rax3000m-emmc
       variant_filter:
         description: '選擇插件規格 (all 為全部編譯)'
@@ -46,13 +46,13 @@ env:
 
 jobs:
   build:
-    name: 編譯 ${{ matrix.target }} -${{ matrix.variant }}
+    name: 編譯 ${{ matrix.target }} - ${{ matrix.variant }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        target: ${{ (github.event.inputs.target_filter == '' || github.event.inputs.target_filter == 'all') && fromJSON('["jdcloud_re-cp-03", "cudy_tr3000-v1", "cmcc_rax3000m-emmc"]') || fromJSON(format('["{0}"]', github.event.inputs.target_filter)) }}
+        target: ${{ (github.event.inputs.target_filter == '' || github.event.inputs.target_filter == 'all') && fromJSON('["cudy_tr3000-v1", "jdcloud_re-cp-03", "cmcc_rax3000m-emmc"]') || fromJSON(format('["{0}"]', github.event.inputs.target_filter)) }}
         variant: ${{ (github.event.inputs.variant_filter == '' || github.event.inputs.variant_filter == 'all') && fromJSON('["5-plugins", "3-plugins"]') || fromJSON(format('["{0}"]', github.event.inputs.variant_filter)) }}
 
     steps:
@@ -94,7 +94,7 @@ jobs:
             qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo time \
             u-boot-tools uglifyjs unzip vim wget xmlto xsltproc xxd xz-utils zlib1g-dev zstd
 
-          # 3. 安裝官方最新版 UPX (配合下方 rstrip.sh 白名單保護，大幅縮減 5-plugins 韌體體積，防止 128MB 閃存分區爆滿重啟)
+          # 3. 安裝官方最新版 UPX (配合下方 rstrip.sh 白名單保護，大幅縮減 5-plugins 韌體體積，防止閃存分區爆滿重啟)
           UPX_VER="4.2.4"
           if curl -fsSL --retry 3 "https://github.com/upx/upx/releases/download/v${UPX_VER}/upx-${UPX_VER}-amd64_linux.tar.xz" -o /tmp/upx.tar.xz; then
             tar -Jxf /tmp/upx.tar.xz -C /tmp
@@ -107,16 +107,25 @@ jobs:
           sudo timedatectl set-timezone "Asia/Taipei"
           df -hT
 
-      - name: 拉取 ImmortalWrt 官方原始碼 (Clone ImmortalWrt Source)
+      - name: 拉取 ImmortalWrt 原始碼 (Clone ImmortalWrt Source)
         run: |
           BRANCH="${{ github.event.inputs.source_branch || 'openwrt-25.12' }}"
-          if [ "$BRANCH" = "mt798x-24.10-bin" ]; then
-            echo "拉取 padavanonly/immortalwrt-mt798x-6.6 (openwrt-24.10-6.6) 分支..."
-            git clone --depth 1 --single-branch -b openwrt-24.10-6.6 --filter=blob:none https://github.com/padavanonly/immortalwrt-mt798x-6.6.git openwrt
-          else
-            echo "拉取 ImmortalWrt 官方倉庫分支: $BRANCH ..."
-            git clone --depth 1 --single-branch -b "$BRANCH" --filter=blob:none https://github.com/immortalwrt/immortalwrt.git openwrt
-          fi
+          case "$BRANCH" in
+            chasey-25.12)
+              echo "拉取與 Yuzhii U-Boot 配套的 chasey-dev/immortalwrt-mt798x-rebase (25.12 分支)..."
+              git clone --depth 1 --single-branch -b 25.12 --filter=blob:none https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git openwrt
+              ;;
+            yuzhii-mt798x-6.6-bin)
+              echo "拉取 Yuzhii0718/immortalwrt-mt798x-6.6-padavanonly (openwrt-24.10-6.6 原生 BIN 分支)..."
+              if ! git clone --depth 1 --single-branch -b openwrt-24.10-6.6 --filter=blob:none https://github.com/Yuzhii0718/immortalwrt-mt798x-6.6-padavanonly.git openwrt; then
+                git clone --depth 1 --single-branch -b openwrt-24.10-6.6 --filter=blob:none https://github.com/padavanonly/immortalwrt-mt798x-6.6.git openwrt
+              fi
+              ;;
+            *)
+              echo "拉取 ImmortalWrt 官方倉庫分支: $BRANCH ..."
+              git clone --depth 1 --single-branch -b "$BRANCH" --filter=blob:none https://github.com/immortalwrt/immortalwrt.git openwrt
+              ;;
+          esac
 
       - name: 載入 ccache 跨任務編譯快取 (Restore ccache)
         uses: actions/cache@v4
@@ -127,6 +136,24 @@ jobs:
             ccache-${{ github.event.inputs.source_branch || 'openwrt-25.12' }}-${{ matrix.variant }}-${{ matrix.target }}-
             ccache-${{ github.event.inputs.source_branch || 'openwrt-25.12' }}-${{ matrix.variant }}-
             ccache-${{ github.event.inputs.source_branch || 'openwrt-25.12' }}-
+
+      - name: 針對 Yuzhii0718 SP2 DHCPD U-Boot 修正 cudy_tr3000-v1 原生 UBI# (.bin) 打包配方
+        working-directory: ./openwrt
+        run: |
+          FILOGIC_MK="target/linux/mediatek/image/filogic.mk"
+
+          # 關鍵修復：
+          # 官方 openwrt-25.12 的 filogic.mk 中，cudy_tr3000-v1 預設為：
+          #   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+          # 該配置生成的 .bin 內部其實是 POSIX .tar 壓縮包（開頭為 ASCII "sysupgrade-cudy_tr3000-v1/"），僅供已進入 OpenWrt 後在 LuCI 網頁升級解包。
+          # 若在 fip-mt7981_cudy_tr3000-v1_SP2-Yuzhii-dhcpd-fixed-parts 的 192.168.1.1 網頁直刷，U-Boot 會將 .tar 原始位元組直接寫入 NAND ubi 分區，
+          # 導致開機時 ubi part ubi 找不到 UBI# (0x55424923) 標頭而無限重啟退回 192.168.1.1！
+          # 此處將 sysupgrade-tar 修正為 append-ubi | check-size，讓編譯器透過 ubinize 原生輸出真正的 UBI# (.bin) 韌體，同時相容 Yuzhii U-Boot 直刷與 LuCI 升級！
+          if [ -f "$FILOGIC_MK" ]; then
+            sed -i '/define Device\/cudy_tr3000-v1$/,/^endef$/ s/sysupgrade-tar/append-ubi | check-size/' "$FILOGIC_MK"
+            echo "=== 已修正 cudy_tr3000-v1 打包配方為 append-ubi (原生 UBI# .bin) ==="
+            sed -n '/define Device\/cudy_tr3000-v1$/,/^endef$/p' "$FILOGIC_MK"
+          fi
 
       - name: 安裝外部擴充套件與更新來源 (Install Extra Feeds & Plugins)
         working-directory: ./openwrt
@@ -139,7 +166,7 @@ jobs:
           ./scripts/feeds install -a -f -p nikki
 
           # === 階段 2：移除 nikki 對原版 mihomo 二進位的強制依賴 ===
-          # 關鍵修復：避免打包時同時塞入原版與 Smart 兩份 40MB 核心，防止 cudy_tr3000-v1 分區空間溢出導致無限重啟
+          # 關鍵修復：避免打包時同時塞入原版與 Smart 兩份 40MB 核心，防止分區空間溢出導致無限重啟
           for mk in feeds/nikki/nikki/Makefile package/feeds/nikki/nikki/Makefile; do
             if [ -f "$mk" ]; then
               sed -i 's/+mihomo-meta//g; s/+mihomo-alpha//g; s/+mihomo //g; s/+mihomo$//g' "$mk"
@@ -147,7 +174,6 @@ jobs:
           done
 
           # === 階段 3：保護自訂 mihomo 核心不被 OpenWrt rstrip.sh 剝離符號破壞 ===
-          # 關鍵修復：OpenWrt 打包 RootFS 時執行 rstrip.sh 會破壞預編譯/UPX 的 Go 核心，必須在 rstrip.sh 中排除 mihomo
           if [ -f scripts/rstrip.sh ]; then
             sed -i 's/find \$TARGETS -type f/find \$TARGETS -type f ! -name "mihomo*"/g' scripts/rstrip.sh
           fi
@@ -207,7 +233,7 @@ jobs:
             fi
 
             # 3. 三重備援：從 vernesong/mihomo Release 展開頁面抓取
-            if [ -z "$SMART_URL" ] \vert{}\vert{} [ "$SMART_URL" = "null" ]; then
+            if [ -z "$SMART_URL" ] || [ "$SMART_URL" = "null" ]; then
               echo "嘗試從 vernesong/mihomo Release 頁面提取最新檔案鏈接..."
               EXPANDED_HTML=$(curl -sL --retry 3 https://github.com/vernesong/mihomo/releases/expanded_assets/Prerelease-Alpha || true)
               REL_PATH=$(echo "$EXPANDED_HTML" \
@@ -218,7 +244,7 @@ jobs:
               fi
             fi
 
-            if [ -z "$SMART_URL" ] \vert{}\vert{} [ "$SMART_URL" = "null" ]; then
+            if [ -z "$SMART_URL" ] || [ "$SMART_URL" = "null" ]; then
               echo "::error::無法從 vernesong/mihomo (Prerelease-Alpha) 取得有效 arm64 Smart 核心下載位址！"
               exit 1
             fi
@@ -287,7 +313,7 @@ jobs:
           echo "CONFIG_TARGET_mediatek=y" >> .config
           echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
 
-          # 自動偵測當前源碼樹中的設備 Profile 名稱 (相容 cmcc_rax3000m-emmc 與 cmcc_rax3000m)
+          # 自動偵測當前源碼樹中的設備 Profile 名稱
           case "${{ matrix.target }}" in
             jdcloud_re-cp-03)
               echo "CONFIG_TARGET_mediatek_filogic_DEVICE_jdcloud_re-cp-03=y" >> .config
@@ -318,9 +344,11 @@ jobs:
           echo "CONFIG_DEVEL=y" >> .config
           echo "CONFIG_CCACHE=y" >> .config
 
-          # 基礎系統本地化、HTTPS 憑證與 LuCI 界面配置
+          # 基礎系統本地化、MTD 解鎖模組、UBI 工具、HTTPS 憑證與 LuCI 界面配置
           echo "CONFIG_PACKAGE_default-settings-chn=y" >> .config
           echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-mtd-rw=y" >> .config
+          echo "CONFIG_PACKAGE_ubi-utils=y" >> .config
           echo "CONFIG_PACKAGE_ca-bundle=y" >> .config
           echo "CONFIG_PACKAGE_curl=y" >> .config
           echo "CONFIG_PACKAGE_luci=y" >> .config
@@ -348,7 +376,6 @@ jobs:
             echo "CONFIG_PACKAGE_nikki=y" >> .config
             echo "CONFIG_PACKAGE_luci-app-nikki=y" >> .config
             echo "CONFIG_PACKAGE_luci-i18n-nikki-zh-cn=y" >> .config
-            # 已於上方移除 nikki 對原版 mihomo 的依賴，此處禁用所有內建 mihomo 包，僅使用 files/ 下的 Alpha-Smart 核心
             echo "# CONFIG_PACKAGE_mihomo is not set" >> .config
             echo "# CONFIG_PACKAGE_mihomo-meta is not set" >> .config
             echo "# CONFIG_PACKAGE_mihomo-alpha is not set" >> .config
@@ -381,14 +408,39 @@ jobs:
           fi
           df -hT
 
-      - name: 編譯韌體 (Compile Firmware)
+      - name: 編譯韌體並為 cudy_tr3000-v1 同步生成 64M 與 112M 雙分區 UBI# (.bin) 鏡像
         working-directory: ./openwrt
         run: |
           echo "$(nproc) 執行緒開始編譯..."
           make -j$(nproc) || make -j1 V=s
+
+          # 若目標為 cudy_tr3000-v1，先暫存 64M 標準分區版 .bin，再用 10 秒快速打包一份 112M 擴容分區版 .bin
+          # 確保無論 Yuzhii fixed-parts U-Boot 內部定義為 64M (0x4000000) 或 112M (0x7000000) 均有對應的原生 UBI# (.bin) 可刷！
+          TARGET_DIR=$(find bin/targets -mindepth 2 -maxdepth 2 -type d | head -n 1)
+          CUDY_DTS="target/linux/mediatek/dts/mt7981b-cudy-tr3000-v1.dts"
+          FILOGIC_MK="target/linux/mediatek/image/filogic.mk"
+
+          if [ "${{ matrix.target }}" = "cudy_tr3000-v1" ] && [ -f "$CUDY_DTS" ] && grep -q "0x4000000" "$CUDY_DTS"; then
+            for f in "$TARGET_DIR"/*cudy_tr3000-v1*squashfs-sysupgrade.bin; do
+              if [ -f "$f" ]; then
+                cp -f "$f" "${f%-squashfs-sysupgrade.bin}-64M-squashfs-sysupgrade.bin"
+              fi
+            done
+
+            echo "正在為 cudy_tr3000-v1 額外封裝 112M 大分區 (0x7000000) 原生 UBI# .bin 鏡像..."
+            sed -i 's/reg = <0x5c0000 0x4000000>;/reg = <0x5c0000 0x7000000>;/g' "$CUDY_DTS"
+            sed -i '/define Device\/cudy_tr3000-v1$/,/^endef$/ s/IMAGE_SIZE := 65536k/IMAGE_SIZE := 114688k/' "$FILOGIC_MK"
+            make target/linux/install -j$(nproc)
+
+            for f in "$TARGET_DIR"/*cudy_tr3000-v1-squashfs-sysupgrade.bin; do
+              if [ -f "$f" ]; then
+                mv -f "$f" "${f%-squashfs-sysupgrade.bin}-112M-squashfs-sysupgrade.bin"
+              fi
+            done
+          fi
           df -hT
 
-      - name: 整理與重新命名韌體 (Organize & Rename Firmware) - 保留真實編譯格式不強行改名
+      - name: 整理、驗證 UBI#/FIT 標頭並重新命名韌體 (Organize & Verify Firmware)
         id: organize
         run: |
           cd openwrt
@@ -409,7 +461,7 @@ jobs:
           fi
 
           TARGET_DIR=$(find bin/targets -mindepth 2 -maxdepth 2 -type d | head -n 1)
-          if [ -z "$TARGET_DIR" ] \vert{}\vert{} [ ! -d "$TARGET_DIR" ]; then
+          if [ -z "$TARGET_DIR" ] || [ ! -d "$TARGET_DIR" ]; then
             echo "::error::找不到目標韌體目錄 bin/targets/*/*"
             exit 1
           fi
@@ -422,7 +474,7 @@ jobs:
           cd "$TARGET_DIR"
           shopt -s nullglob
           COUNT=0
-          # 嚴格保留編譯器原生生成的副檔名 (${EXT})，絕不把 .itb 強行改名為 .bin
+          # 嚴格保留編譯器原生生成的副檔名 (${EXT})，並校驗二進位魔數標頭
           for file in *.bin *.itb; do
             if [ ! -f "$file" ]; then
               continue
@@ -430,10 +482,28 @@ jobs:
             lower_file=$(echo "$file" | tr '[:upper:]' '[:lower:]')
             if [[ "$lower_file" =~ squashfs-sysupgrade ]]; then
               EXT="${file##*.}"
-              NEW_NAME="${DEV_NAME}-${IMG_VERSION}-squashfs-sysupgrade-${PLUGIN_NUM}.${EXT}"
-              echo "命名歸檔: $file ->$NEW_NAME"
+              MAGIC_HEX=$(xxd -p -l 4 "$file" 2>/dev/null || true)
+              echo "檢查韌體 [$file] 前 4 位元組魔數標頭: 0x${MAGIC_HEX}"
+              if [ "$MAGIC_HEX" = "73797375" ]; then
+                echo "::error::韌體 [$file] 仍為 sysupgrade-tar (.tar) 歸檔格式 (0x73797375)，無法在 Yuzhii U-Boot 網頁直刷！"
+                exit 1
+              fi
+
+              if [[ "$lower_file" =~ -64m-squashfs-sysupgrade ]]; then
+                NEW_NAME="${DEV_NAME}-64M-${IMG_VERSION}-squashfs-sysupgrade-${PLUGIN_NUM}.${EXT}"
+              elif [[ "$lower_file" =~ -112m-squashfs-sysupgrade ]]; then
+                NEW_NAME="${DEV_NAME}-112M-${IMG_VERSION}-squashfs-sysupgrade-${PLUGIN_NUM}.${EXT}"
+              else
+                NEW_NAME="${DEV_NAME}-${IMG_VERSION}-squashfs-sysupgrade-${PLUGIN_NUM}.${EXT}"
+              fi
+
+              echo "命名歸檔: $file (Header: 0x${MAGIC_HEX}) ->$NEW_NAME"
               cp -f "$file" "$GITHUB_WORKSPACE/collected_firmware/$NEW_NAME"
               COUNT=$((COUNT + 1))
+            elif [[ "$lower_file" =~ -gpt\.bin$ ]]; then
+              GPT_NAME="${DEV_NAME}-${IMG_VERSION}-gpt.bin"
+              cp -f "$file" "$GITHUB_WORKSPACE/collected_firmware/$GPT_NAME"
+              echo "附帶歸檔 eMMC GPT 分區表: $file ->$GPT_NAME"
             else
               echo "跳過非 sysupgrade 檔案: $file"
             fi
@@ -486,11 +556,11 @@ jobs:
           cd ..
 
           cat > release_notes.md << EOF
-          ## 🚀 ImmortalWrt 25.12 多設備純淨自編韌體發布
+          ## 🚀 ImmortalWrt 多設備純淨自編韌體發布 (專為 Yuzhii0718 SP2 DHCPD U-Boot 適配)
 
           - **建置時間**: \`${BUILD_TIME}\`
           - **建置編號**: \`#${{ github.run_number }}\`
-          - **支援設備**: \`cudy_tr3000-v1\`（128MB）、\`jdcloud_re-cp-03\`、\`cmcc_rax3000m-emmc\`
+          - **支援設備**: \`cudy_tr3000-v1\`（同時提供 64M 與 112M 原生 \`UBI#\` \`.bin\`）、\`jdcloud_re-cp-03\`、\`cmcc_rax3000m-emmc\`
           - **預設管理地址**: \`http://192.168.7.1\`（root 無密碼）
           - **預設主題**: Argon
 
@@ -508,7 +578,7 @@ jobs:
 
           ---
 
-          ### 📂 發布檔案下載清單與 SHA256 校驗碼（僅 squashfs-sysupgrade）
+          ### 📂 發布檔案下載清單與 SHA256 校驗碼
           \`\`\`text
           $(cat all_firmwares/sha256sums.txt)
           \`\`\`
@@ -518,7 +588,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: "ImmortalWrt 25.12 多設備官方純淨韌體 (${{ env.RELEASE_TAG }})"
+          name: "ImmortalWrt 多設備純淨韌體 (${{ env.RELEASE_TAG }})"
           body_path: release_notes.md
           files: |
             all_firmwares/*.bin
