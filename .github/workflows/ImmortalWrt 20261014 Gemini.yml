@@ -3,6 +3,16 @@ name: ImmortalWrt (20261014 Gemini優化、純淨官方滾動主線)
 on:
   workflow_dispatch:
     inputs:
+      source_branch:
+        description: '選擇 ImmortalWrt 源碼分支 (預設為官方最新穩定版 openwrt-25.12)'
+        required: false
+        default: 'openwrt-25.12'
+        type: choice
+        options:
+          - openwrt-25.12
+          - openwrt-24.10
+          - master
+          - mt798x-24.10-bin
       target_filter:
         description: '選擇編譯設備 (all 為全部編譯)'
         required: false
@@ -27,7 +37,6 @@ permissions:
   contents: write
   actions: read
 
-# 避免同一分支重複手動觸發時浪費算力，排隊中的舊同名任務可自動替換
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -54,7 +63,7 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # 1. 多執行緒併發釋放磁碟空間 (比單執行緒 rm -rf 快 4~6 倍，節省約 1.5 分鐘)
+          # 1. 多執行緒併發釋放磁碟空間
           printf '%s\n' \
             /usr/share/dotnet \
             /usr/local/lib/android \
@@ -70,7 +79,7 @@ jobs:
             /usr/local/lib/node_modules \
             | xargs -P "$(nproc)" sudo rm -rf
 
-          # 2. 停用耗時的 man-db 索引重建觸發器，大幅加速 apt-get 安裝過程
+          # 2. 停用耗時的 man-db 索引重建觸發器並安裝完整編譯依賴
           sudo rm -rf /var/lib/man-db/auto-update
           sudo -E apt-get -qq update
           sudo -E apt-get -qq -o Dpkg::Use-Pty=0 install -y --no-install-recommends \
@@ -85,44 +94,71 @@ jobs:
             qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo time \
             u-boot-tools uglifyjs unzip vim wget xmlto xsltproc xxd xz-utils zlib1g-dev zstd
 
+          # 3. 安裝官方最新版 UPX (配合下方 rstrip.sh 白名單保護，大幅縮減 5-plugins 韌體體積，防止 128MB 閃存分區爆滿重啟)
+          UPX_VER="4.2.4"
+          if curl -fsSL --retry 3 "https://github.com/upx/upx/releases/download/v${UPX_VER}/upx-${UPX_VER}-amd64_linux.tar.xz" -o /tmp/upx.tar.xz; then
+            tar -Jxf /tmp/upx.tar.xz -C /tmp
+            sudo cp -f "/tmp/upx-${UPX_VER}-amd64_linux/upx" /usr/local/bin/upx
+            sudo chmod +x /usr/local/bin/upx
+            rm -rf /tmp/upx*
+          fi
+
           sudo -E apt-get -qq clean
           sudo timedatectl set-timezone "Asia/Taipei"
           df -hT
 
-      - name: 拉取 ImmortalWrt 官方最新主線原始碼 (Clone Master Branch)
+      - name: 拉取 ImmortalWrt 官方原始碼 (Clone ImmortalWrt Source)
         run: |
-          git clone --depth 1 --single-branch --filter=blob:none https://github.com/immortalwrt/immortalwrt.git openwrt
+          BRANCH="${{ github.event.inputs.source_branch || 'openwrt-25.12' }}"
+          if [ "$BRANCH" = "mt798x-24.10-bin" ]; then
+            echo "拉取 padavanonly/immortalwrt-mt798x-6.6 (openwrt-24.10-6.6) 分支..."
+            git clone --depth 1 --single-branch -b openwrt-24.10-6.6 --filter=blob:none https://github.com/padavanonly/immortalwrt-mt798x-6.6.git openwrt
+          else
+            echo "拉取 ImmortalWrt 官方倉庫分支: $BRANCH ..."
+            git clone --depth 1 --single-branch -b "$BRANCH" --filter=blob:none https://github.com/immortalwrt/immortalwrt.git openwrt
+          fi
 
       - name: 載入 ccache 跨任務編譯快取 (Restore ccache)
         uses: actions/cache@v4
         with:
           path: openwrt/.ccache
-          key: ccache-mediatek-filogic-${{ matrix.variant }}-${{ matrix.target }}-${{ github.run_id }}
+          key: ccache-${{ github.event.inputs.source_branch || 'openwrt-25.12' }}-${{ matrix.variant }}-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: |
-            ccache-mediatek-filogic-${{ matrix.variant }}-${{ matrix.target }}-
-            ccache-mediatek-filogic-${{ matrix.variant }}-
-            ccache-mediatek-filogic-
+            ccache-${{ github.event.inputs.source_branch || 'openwrt-25.12' }}-${{ matrix.variant }}-${{ matrix.target }}-
+            ccache-${{ github.event.inputs.source_branch || 'openwrt-25.12' }}-${{ matrix.variant }}-
+            ccache-${{ github.event.inputs.source_branch || 'openwrt-25.12' }}-
 
       - name: 安裝外部擴充套件與更新來源 (Install Extra Feeds & Plugins)
         working-directory: ./openwrt
         run: |
-          # === 階段 1 (對應 P3TERX diy-part1.sh)：更新 feeds 前追加軟體源 ===
+          # === 階段 1：追加 Nikki 官方軟體源 ===
           echo "src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main" >> feeds.conf.default
 
-          # 更新所有 feeds 索引並安裝套件連結
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           ./scripts/feeds install -a -f -p nikki
 
-          # === 階段 2 (對應 P3TERX diy-part2.sh)：清理同名套件衝突並覆蓋最新套件 ===
-          # 徹底移除官方 feeds 內可能存在的舊版 rtp2httpd 及其軟連結，避免與最新源碼衝突
+          # === 階段 2：移除 nikki 對原版 mihomo 二進位的強制依賴 ===
+          # 關鍵修復：避免打包時同時塞入原版與 Smart 兩份 40MB 核心，防止 cudy_tr3000-v1 分區空間溢出導致無限重啟
+          for mk in feeds/nikki/nikki/Makefile package/feeds/nikki/nikki/Makefile; do
+            if [ -f "$mk" ]; then
+              sed -i 's/+mihomo-meta//g; s/+mihomo-alpha//g; s/+mihomo //g; s/+mihomo$//g' "$mk"
+            fi
+          done
+
+          # === 階段 3：保護自訂 mihomo 核心不被 OpenWrt rstrip.sh 剝離符號破壞 ===
+          # 關鍵修復：OpenWrt 打包 RootFS 時執行 rstrip.sh 會破壞預編譯/UPX 的 Go 核心，必須在 rstrip.sh 中排除 mihomo
+          if [ -f scripts/rstrip.sh ]; then
+            sed -i 's/find \$TARGETS -type f/find \$TARGETS -type f ! -name "mihomo*"/g' scripts/rstrip.sh
+          fi
+
+          # === 階段 4：清理舊版 rtp2httpd 並引入最新官方免 Node 版本 ===
           rm -rf feeds/packages/net/rtp2httpd
           rm -rf feeds/luci/applications/luci-app-rtp2httpd
           rm -rf package/feeds/packages/rtp2httpd
           rm -rf package/feeds/luci/luci-app-rtp2httpd
           rm -rf package/rtp2httpd package/luci-app-rtp2httpd
 
-          # 引入 stackia/rtp2httpd 官方安裝支援（切換為免本地 Node 構建的 Makefile.versioned）
           git clone --depth 1 --single-branch https://github.com/stackia/rtp2httpd.git /tmp/rtp2httpd
           cp -rf /tmp/rtp2httpd/openwrt-support/rtp2httpd package/rtp2httpd
           cp -rf /tmp/rtp2httpd/openwrt-support/luci-app-rtp2httpd package/luci-app-rtp2httpd
@@ -134,7 +170,7 @@ jobs:
           fi
           rm -rf /tmp/rtp2httpd
 
-          # 強制將所有 LuCI 集合預設主題由 bootstrap 改為 Argon（ImmortalWrt 已內建）
+          # 強制將所有 LuCI 集合預設主題由 bootstrap 改為 Argon
           find feeds/luci/collections/ -name "Makefile" -exec sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' {} + || true
 
       - name: 預置 Nikki 官方推薦 Alpha-Smart 核心與雙路徑部署 (Custom Smart Core)
@@ -147,7 +183,7 @@ jobs:
             mkdir -p files/usr/libexec files/usr/bin
             rm -f /tmp/mihomo-smart*
 
-            # 1. 首選方案：遵循 OpenWrt-nikki 官方 Wiki FAQ 規範，直接讀取 version.txt 精準拼接下載 URL (免 API 配額限制、最快最穩)
+            # 1. 首選方案：遵循 OpenWrt-nikki 官方 Wiki FAQ 規範，直接讀取 version.txt 精準拼接下載 URL
             SMART_URL=""
             SMART_VER=$(curl -fsSL --retry 3 https://github.com/vernesong/mihomo/releases/download/Prerelease-Alpha/version.txt | tr -d '[:space:]' || true)
             if [ -n "$SMART_VER" ]; then
@@ -158,7 +194,7 @@ jobs:
               fi
             fi
 
-            # 2. 次選方案：若 version.txt 未命中，透過 GitHub API 查詢 vernesong/mihomo Prerelease-Alpha 最新 arm64 核心
+            # 2. 次選方案：透過 GitHub API 查詢 vernesong/mihomo Prerelease-Alpha 最新 arm64 核心
             if [ -z "$SMART_URL" ]; then
               RELEASE_JSON=$(curl -sL --retry 3 \
                 -H "Accept: application/vnd.github+json" \
@@ -170,7 +206,7 @@ jobs:
                 | head -n 1 || true)
             fi
 
-            # 3. 三重備援：若 API 受限，從 vernesong/mihomo Release 展開頁面抓取 (不使用 vernesong/OpenClash core 分支，避免路徑與相容性問題)
+            # 3. 三重備援：從 vernesong/mihomo Release 展開頁面抓取
             if [ -z "$SMART_URL" ] \vert{}\vert{} [ "$SMART_URL" = "null" ]; then
               echo "嘗試從 vernesong/mihomo Release 頁面提取最新檔案鏈接..."
               EXPANDED_HTML=$(curl -sL --retry 3 https://github.com/vernesong/mihomo/releases/expanded_assets/Prerelease-Alpha || true)
@@ -191,16 +227,28 @@ jobs:
             curl -fsSL --retry 3 -o /tmp/mihomo-smart.gz "$SMART_URL"
             gzip -d -f /tmp/mihomo-smart.gz
 
-            # 4. 驗證二進位完整性與架構 (確保為有效 ARM aarch64 ELF 執行檔)
-            # 注意：不對 files/ 下的核心做 UPX 加殼，否則 OpenWrt 打包階段執行 rstrip.sh 剝離符號時會破壞 UPX 殼導致路由器上執行閃退！
+            # 4. 驗證二進位完整性與架構
             if [ ! -s /tmp/mihomo-smart ] || ! file /tmp/mihomo-smart | grep -qiE "ELF.*(aarch64|arm64)"; then
               echo "::error::下載的 mihomo 核心檔案損毀或非有效 arm64 ELF 二進位！"
               file /tmp/mihomo-smart || true
               exit 1
             fi
+            chmod 0755 /tmp/mihomo-smart
 
-            # 5. 遵循最新版 OpenWrt-nikki 規範：核心位於 /usr/libexec/mihomo，並建立相對路徑軟連結 /usr/bin/mihomo -> ../libexec/mihomo
-            # 相對軟連結可確保編譯宿主機 rstrip.sh 檢查與路由器執行環境雙端 100% 有效，且避免韌體內重複打包兩份 35MB 核心
+            # 5. 使用 UPX 壓縮核心體積 (已於上方 rstrip.sh 設置白名單保護，不會被 strip 破壞，確保分區不溢出)
+            if command -v upx >/dev/null 2>&1; then
+              echo "正在執行安全 UPX 壓縮以縮減韌體分區佔用..."
+              cp -f /tmp/mihomo-smart /tmp/mihomo-smart.upx
+              if upx -9 /tmp/mihomo-smart.upx && [ -s /tmp/mihomo-smart.upx ]; then
+                mv -f /tmp/mihomo-smart.upx /tmp/mihomo-smart
+                echo "UPX 壓縮成功！"
+              else
+                rm -f /tmp/mihomo-smart.upx
+                echo "UPX 壓縮略過，保留原二進位"
+              fi
+            fi
+
+            # 6. 同時相容新舊版 Nikki 核心路徑 (/usr/libexec/mihomo 與 /usr/bin/mihomo)
             mv -f /tmp/mihomo-smart files/usr/libexec/mihomo
             chmod 0755 files/usr/libexec/mihomo
             ln -sf ../libexec/mihomo files/usr/bin/mihomo
@@ -212,10 +260,14 @@ jobs:
       - name: 設置默認 LAN IP 為 192.168.7.1 (Configure Default LAN IP)
         working-directory: ./openwrt
         run: |
-          # 1. 直接修改源碼底層 config_generate 預設 IP (遵循 P3TERX 規範，重置系統亦生效)
-          sed -i 's/192.168.1.1/192.168.7.1/g' package/base-files/files/bin/config_generate
+          # 1. 修改所有可能存在的 config_generate 與 preinit 預設 IP (確保開機全階段均為 192.168.7.1)
+          for cfg in package/base-files/files/bin/config_generate package/base-files/luci2/bin/config_generate package/base-files/files/lib/preinit/00_preinit.conf; do
+            if [ -f "$cfg" ]; then
+              sed -i 's/192.168.1.1/192.168.7.1/g' "$cfg"
+            fi
+          done
 
-          # 2. 雙重保險：建立 99-z-change-lan-ip 確保排序在 99-default-settings 之後最後執行
+          # 2. 建立 99-z-change-lan-ip 確保排序在 99-default-settings 之後最後執行
           mkdir -p files/etc/uci-defaults
           cat > files/etc/uci-defaults/99-z-change-lan-ip << 'EOF'
           #!/bin/sh
@@ -232,10 +284,10 @@ jobs:
           rm -f .config
           touch .config
 
-          # 1. 目標晶片平台與設備 Profile 配置
-          # 注意：ImmortalWrt 官方主線中 CMCC RAX3000M (含 eMMC/NAND) 統一使用 cmcc_rax3000m (透過 DT Overlay 支援 eMMC)
           echo "CONFIG_TARGET_mediatek=y" >> .config
           echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
+
+          # 自動偵測當前源碼樹中的設備 Profile 名稱 (相容 cmcc_rax3000m-emmc 與 cmcc_rax3000m)
           case "${{ matrix.target }}" in
             jdcloud_re-cp-03)
               echo "CONFIG_TARGET_mediatek_filogic_DEVICE_jdcloud_re-cp-03=y" >> .config
@@ -244,7 +296,11 @@ jobs:
               echo "CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-v1=y" >> .config
               ;;
             cmcc_rax3000m-emmc|cmcc_rax3000m)
-              echo "CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m=y" >> .config
+              if grep -q "cmcc_rax3000m-emmc" target/linux/mediatek/image/*.mk 2>/dev/null; then
+                echo "CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m-emmc=y" >> .config
+              else
+                echo "CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m=y" >> .config
+              fi
               ;;
             *)
               echo "::error::未識別的目標設備: ${{ matrix.target }}"
@@ -252,13 +308,17 @@ jobs:
               ;;
           esac
 
-          # 2. 啟用 ccache 編譯加速與關閉多餘鏡像格式 (大幅縮短編譯與打包時間)
-          echo "CONFIG_DEVEL=y" >> .config
-          echo "CONFIG_CCACHE=y" >> .config
+          # 明確指定 SquashFS 韌體鏡像格式與 Preinit IP，關閉多餘鏡像格式
+          echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y" >> .config
           echo "# CONFIG_TARGET_ROOTFS_EXT4FS is not set" >> .config
           echo "# CONFIG_TARGET_ROOTFS_TARGZ is not set" >> .config
+          echo 'CONFIG_TARGET_PREINIT_IP="192.168.7.1"' >> .config
 
-          # 3. 基礎系統本地化、HTTPS 憑證與 LuCI 界面配置
+          # 啟用 ccache 編譯加速
+          echo "CONFIG_DEVEL=y" >> .config
+          echo "CONFIG_CCACHE=y" >> .config
+
+          # 基礎系統本地化、HTTPS 憑證與 LuCI 界面配置
           echo "CONFIG_PACKAGE_default-settings-chn=y" >> .config
           echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
           echo "CONFIG_PACKAGE_ca-bundle=y" >> .config
@@ -271,11 +331,11 @@ jobs:
           echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y" >> .config
 
-          # 4. 取消預設 bootstrap 主題，啟用 Argon 主題 (基礎插件 1)
+          # 取消預設 bootstrap 主題，啟用 Argon 主題 (基礎插件 1)
           echo "# CONFIG_PACKAGE_luci-theme-bootstrap is not set" >> .config
           echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
 
-          # 5. 基礎 3-plugins (Argon + ttyd + DDNS 含完整服務商支援)
+          # 基礎 3-plugins (Argon + ttyd + DDNS)
           echo "CONFIG_PACKAGE_luci-app-ttyd=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-ddns=y" >> .config
@@ -283,14 +343,14 @@ jobs:
           echo "CONFIG_PACKAGE_ddns-scripts=y" >> .config
           echo "CONFIG_PACKAGE_ddns-scripts-services=y" >> .config
 
-          # 6. 進階 5-plugins (額外整合 Nikki 與 rtp2httpd)
+          # 進階 5-plugins (額外整合 Nikki 與 rtp2httpd)
           if [ "${{ matrix.variant }}" = "5-plugins" ]; then
             echo "CONFIG_PACKAGE_nikki=y" >> .config
-            echo "CONFIG_PACKAGE_mihomo-meta=y" >> .config
             echo "CONFIG_PACKAGE_luci-app-nikki=y" >> .config
             echo "CONFIG_PACKAGE_luci-i18n-nikki-zh-cn=y" >> .config
-            # 明確指定使用 nikki 的 mihomo-meta 提供者，禁用 feeds/packages 的 mihomo 與 mihomo-alpha，杜絕衝突
+            # 已於上方移除 nikki 對原版 mihomo 的依賴，此處禁用所有內建 mihomo 包，僅使用 files/ 下的 Alpha-Smart 核心
             echo "# CONFIG_PACKAGE_mihomo is not set" >> .config
+            echo "# CONFIG_PACKAGE_mihomo-meta is not set" >> .config
             echo "# CONFIG_PACKAGE_mihomo-alpha is not set" >> .config
 
             echo "CONFIG_PACKAGE_rtp2httpd=y" >> .config
@@ -298,7 +358,6 @@ jobs:
             echo "CONFIG_PACKAGE_luci-i18n-rtp2httpd-zh-cn=y" >> .config
           fi
 
-          # 生成完整依賴配置並驗證目標設備與關鍵套件是否正確寫入
           make defconfig
 
           echo "=== 驗證目標設備與關鍵套件配置 ==="
@@ -307,13 +366,12 @@ jobs:
             exit 1
           fi
           grep -E '^CONFIG_TARGET_mediatek_filogic_DEVICE_.*=y' .config
-          grep -E '^CONFIG_PACKAGE_(luci-theme-argon|luci-app-ttyd|luci-app-ddns|nikki|mihomo-meta|luci-app-nikki|rtp2httpd|luci-app-rtp2httpd)=' .config || true
+          grep -E '^CONFIG_PACKAGE_(luci-theme-argon|luci-app-ttyd|luci-app-ddns|nikki|luci-app-nikki|rtp2httpd|luci-app-rtp2httpd)=' .config || true
 
       - name: 下載編譯依賴套件 (Download Packages)
         working-directory: ./openwrt
         run: |
           make download -j$(nproc)
-          # 僅當發現損壞殘留小檔案 (<1024 bytes) 時才清理並觸發二次補下載，避免無條件重複執行
           BAD_FILES=$(find dl -type f -size -1024c 2>/dev/null || true)
           if [ -n "$BAD_FILES" ]; then
             echo "發現損壞小檔案，正在清理並重新下載："
@@ -330,12 +388,11 @@ jobs:
           make -j$(nproc) || make -j1 V=s
           df -hT
 
-      - name: 整理與重新命名韌體 (Organize & Rename Firmware) - 統一輸出為 squashfs-sysupgrade .bin 格式
+      - name: 整理與重新命名韌體 (Organize & Rename Firmware) - 保留真實編譯格式不強行改名
         id: organize
         run: |
           cd openwrt
 
-          # 1. 優先從 .config 取版本，否則從 version.mk 解析 (注意避免 [ -z ] && 在 set -e 下非空返回 1 導致崩潰)
           IMG_VERSION=""
           if [ -f .config ]; then
             CFG_VER=$(grep -E '^CONFIG_VERSION_NUMBER=' .config 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
@@ -348,7 +405,7 @@ jobs:
             IMG_VERSION=$(echo "$RAW_VERSION" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?(-[a-zA-Z0-9]+)?' | head -n 1 || true)
           fi
           if [ -z "$IMG_VERSION" ]; then
-            IMG_VERSION="SNAPSHOT"
+            IMG_VERSION="25.12"
           fi
 
           TARGET_DIR=$(find bin/targets -mindepth 2 -maxdepth 2 -type d | head -n 1)
@@ -362,19 +419,18 @@ jobs:
           PLUGIN_NUM=$(echo "${{ matrix.variant }}" | grep -oE '[0-9]+')
           DEV_NAME="${{ matrix.target }}"
 
-          # 2. 匹配所有 squashfs-sysupgrade 升級韌體（跳過 preloader.bin / gpt.bin），並統一歸檔為 .bin 格式
-          # OpenWrt sysupgrade 與 LuCI 升級介面透過檔案標頭 Magic Bytes (0xd00dfeed / sysupgrade-tar) 與尾部 metadata 校驗，
-          # 統一為 .bin 後綴既可直接在 LuCI 網頁升級，亦相容限定 .bin 副檔名的第三方 Web U-Boot 刷機頁面
           cd "$TARGET_DIR"
           shopt -s nullglob
           COUNT=0
+          # 嚴格保留編譯器原生生成的副檔名 (${EXT})，絕不把 .itb 強行改名為 .bin
           for file in *.bin *.itb; do
             if [ ! -f "$file" ]; then
               continue
             fi
             lower_file=$(echo "$file" | tr '[:upper:]' '[:lower:]')
             if [[ "$lower_file" =~ squashfs-sysupgrade ]]; then
-              NEW_NAME="${DEV_NAME}-${IMG_VERSION}-squashfs-sysupgrade-${PLUGIN_NUM}.bin"
+              EXT="${file##*.}"
+              NEW_NAME="${DEV_NAME}-${IMG_VERSION}-squashfs-sysupgrade-${PLUGIN_NUM}.${EXT}"
               echo "命名歸檔: $file ->$NEW_NAME"
               cp -f "$file" "$GITHUB_WORKSPACE/collected_firmware/$NEW_NAME"
               COUNT=$((COUNT + 1))
@@ -394,7 +450,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ matrix.target }}-${{ matrix.variant }}
-          path: collected_firmware/*.bin
+          path: collected_firmware/*
           if-no-files-found: error
           retention-days: 7
 
@@ -420,17 +476,17 @@ jobs:
 
           cd all_firmwares
           shopt -s nullglob
-          FW_FILES=(*.bin)
+          FW_FILES=(*.bin *.itb)
           if [ "${#FW_FILES[@]}" -gt 0 ]; then
             sha256sum "${FW_FILES[@]}" > sha256sums.txt
           else
-            echo "::error::all_firmwares 目錄中未找到任何 .bin 韌體檔案！"
+            echo "::error::all_firmwares 目錄中未找到任何韌體檔案！"
             exit 1
           fi
           cd ..
 
           cat > release_notes.md << EOF
-          ## 🚀 ImmortalWrt 多設備純淨自編韌體發布
+          ## 🚀 ImmortalWrt 25.12 多設備純淨自編韌體發布
 
           - **建置時間**: \`${BUILD_TIME}\`
           - **建置編號**: \`#${{ github.run_number }}\`
@@ -441,18 +497,18 @@ jobs:
           ---
 
           ### 📦 插件版本說明
-          - **3 插件精簡版** (\`-3.bin\`)：
+          - **3 插件精簡版** (\`-3.bin\` / \`-3.itb\`)：
             1. \`luci-theme-argon\`（純淨主題）
             2. \`luci-app-ttyd\`（Web 終端機）
             3. \`luci-app-ddns\` + \`ddns-scripts\` + \`ddns-scripts-services\`（完整 DDNS 動態域名）
-          - **5 插件進階版** (\`-5.bin\`)：
+          - **5 插件進階版** (\`-5.bin\` / \`-5.itb\`)：
             - 包含 3 插件版全部內容
             4. \`luci-app-nikki\`：已預置 \`vernesong/mihomo\` 官方最新 **Alpha-Smart** 核心（\`/usr/libexec/mihomo\`）
             5. \`luci-app-rtp2httpd\` + \`rtp2httpd\`：完整 IPTV 串流轉換服務與 LuCI 管理介面
 
           ---
 
-          ### 📂 發布檔案下載清單與 SHA256 校驗碼（僅 squashfs-sysupgrade .bin）
+          ### 📂 發布檔案下載清單與 SHA256 校驗碼（僅 squashfs-sysupgrade）
           \`\`\`text
           $(cat all_firmwares/sha256sums.txt)
           \`\`\`
@@ -462,11 +518,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: "ImmortalWrt 多設備官方主線純淨韌體 (${{ env.RELEASE_TAG }})"
+          name: "ImmortalWrt 25.12 多設備官方純淨韌體 (${{ env.RELEASE_TAG }})"
           body_path: release_notes.md
           files: |
             all_firmwares/*.bin
+            all_firmwares/*.itb
             all_firmwares/sha256sums.txt
           token: ${{ secrets.GITHUB_TOKEN }}
           generate_release_notes: false
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
