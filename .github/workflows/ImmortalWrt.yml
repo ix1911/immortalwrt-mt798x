@@ -12,7 +12,7 @@ env:
 
 jobs:
   build:
-    name: 編譯 ${{ matrix.target }} - ${{ matrix.variant }}
+    name: 編譯 ${{ matrix.target }} -${{ matrix.variant }}
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     strategy:
@@ -36,7 +36,7 @@ jobs:
             /opt/ghc \
             /opt/hostedtoolcache/CodeQL \
             /usr/local/share/boost \
-            /usr/local/share/swift \
+            /usr/share/swift \
             /usr/share/miniconda \
             /usr/local/graalvm \
             /usr/local/.ghcup \
@@ -135,14 +135,14 @@ jobs:
               | jq -r '.assets[]? | select(.name | test("^mihomo-linux-arm64-alpha-smart-[a-zA-Z0-9._-]+\\.gz$")) | .browser_download_url' \
               | head -n 1 || true)
 
-            if [ -z "$SMART_URL" ] || [ "$SMART_URL" = "null" ]; then
+            if [ -z "$SMART_URL" ] \vert{}\vert{} [ "$SMART_URL" = "null" ]; then
               SMART_URL=$(echo "$RELEASE_JSON" \
                 | jq -r '.assets[]? | select(.name | test("^mihomo-linux-arm64-(go[0-9]+-)?alpha(-smart)?-[a-zA-Z0-9._-]+\\.gz$")) | .browser_download_url' \
                 | head -n 1 || true)
             fi
 
             # 2. 若 API 受限或未匹配，回退至 Release 展開頁面抓取
-            if [ -z "$SMART_URL" ] || [ "$SMART_URL" = "null" ]; then
+            if [ -z "$SMART_URL" ] \vert{}\vert{} [ "$SMART_URL" = "null" ]; then
               echo "API 匹配未命中，嘗試從 Release 頁面提取最新檔案鏈接..."
               EXPANDED_HTML=$(curl -sL --retry 3 https://github.com/vernesong/mihomo/releases/expanded_assets/Prerelease-Alpha || true)
               REL_PATH=$(echo "$EXPANDED_HTML" \
@@ -326,7 +326,7 @@ jobs:
           fi
 
           TARGET_DIR=$(find bin/targets -mindepth 2 -maxdepth 2 -type d | head -n 1)
-          if [ -z "$TARGET_DIR" ] || [ ! -d "$TARGET_DIR" ]; then
+          if [ -z "$TARGET_DIR" ] \vert{}\vert{} [ ! -d "$TARGET_DIR" ]; then
             echo "::error::找不到目標韌體目錄 bin/targets/*/*"
             exit 1
           fi
@@ -348,7 +348,7 @@ jobs:
             if [[ "$lower_file" =~ squashfs-sysupgrade ]]; then
               EXT="${file##*.}"
               NEW_NAME="${DEV_NAME}-${IMG_VERSION}-squashfs-sysupgrade-${PLUGIN_NUM}.${EXT}"
-              echo "命名歸檔: $file -> $NEW_NAME"
+              echo "命名歸檔: $file ->$NEW_NAME"
               cp -f "$file" "$GITHUB_WORKSPACE/collected_firmware/$NEW_NAME"
               COUNT=$((COUNT + 1))
             else
