@@ -698,14 +698,8 @@ jobs:
           echo "CONFIG_PACKAGE_openssh-sftp-avahi-service=y" >> .config
           echo "CONFIG_PACKAGE_avahi-dbus-daemon=y" >> .config
 
-          # 👇 內建硬體流量分載模組 (kmod-nft-offload)、WED 協同韌體與 TCP BBR 核心模組 (kmod-tcp-bbr)
-          echo "CONFIG_PACKAGE_kmod-nft-offload=y" >> .config
+          # 👇 僅內建 TCP BBR 核心模組 (kmod-tcp-bbr)，不額外加入任何其他網路加速套件
           echo "CONFIG_PACKAGE_kmod-tcp-bbr=y" >> .config
-          if [ "${TARGET_PROFILE}" = "jdcloud_re-cp-03" ]; then
-            echo "CONFIG_PACKAGE_mt7986-wo-firmware=y" >> .config
-          else
-            echo "CONFIG_PACKAGE_mt7981-wo-firmware=y" >> .config
-          fi
           # 👆 【插入結束】
 
           # 取消預設 bootstrap 主題，啟用 Argon 主題 (基礎插件 1)
@@ -748,7 +742,7 @@ jobs:
           fi
           grep -E '^CONFIG_TARGET_mediatek_filogic_DEVICE_.*=y' .config
           grep -E '^(VERSION_DIST|VERSION_NUMBER):=' include/version.mk || true
-          grep -E '^CONFIG_PACKAGE_(luci-theme-argon|luci-app-ttyd|luci-app-ddns|openssh-sftp-server|openssh-sftp-avahi-service|kmod-nft-offload|kmod-tcp-bbr|nikki|luci-app-nikki|rtp2httpd|luci-app-rtp2httpd)=' .config || true
+          grep -E '^CONFIG_PACKAGE_(luci-theme-argon|luci-app-ttyd|luci-app-ddns|openssh-sftp-server|openssh-sftp-avahi-service|kmod-tcp-bbr|nikki|luci-app-nikki|rtp2httpd|luci-app-rtp2httpd)=' .config || true
 
       - name: 下載編譯依賴套件 (Download Packages)
         working-directory: ./openwrt
