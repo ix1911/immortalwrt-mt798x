@@ -1,4 +1,4 @@
-name: ImmortalWrt 25.12 (Gemini 1015 第一版)
+name: ImmortalWrt 25.12 (Gemini 1015 第一版 ImmortalWrt 25.12-SNAPSHOT sftp&更新源有BUG )
 
 on:
   workflow_dispatch:
