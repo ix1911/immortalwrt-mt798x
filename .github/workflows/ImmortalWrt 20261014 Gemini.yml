@@ -1,4 +1,4 @@
-name: ImmortalWrt (20261015 Gemini優化、純淨官方滾動主線)
+name: ImmortalWrt 25.12 (專為 Yuzhii0718 bl-mt798x-dhcpd U-Boot 三設備全適配版)
 
 on:
   workflow_dispatch:
@@ -137,23 +137,209 @@ jobs:
             ccache-${{ github.event.inputs.source_branch || 'openwrt-25.12' }}-${{ matrix.variant }}-
             ccache-${{ github.event.inputs.source_branch || 'openwrt-25.12' }}-
 
-      - name: 針對 Yuzhii0718 SP2 DHCPD U-Boot 修正 cudy_tr3000-v1 原生 UBI# (.bin) 打包配方
+      - name: 針對 Yuzhii0718 bl-mt798x-dhcpd U-Boot 全面適配三台設備 (Adapt All 3 Devices)
         working-directory: ./openwrt
         run: |
-          FILOGIC_MK="target/linux/mediatek/image/filogic.mk"
+          python3 - << 'PYEOF'
+          import os, re, glob
 
-          # 關鍵修復：
-          # 官方 openwrt-25.12 的 filogic.mk 中，cudy_tr3000-v1 預設為：
-          #   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
-          # 該配置生成的 .bin 內部其實是 POSIX .tar 壓縮包（開頭為 ASCII "sysupgrade-cudy_tr3000-v1/"），僅供已進入 OpenWrt 後在 LuCI 網頁升級解包。
-          # 若在 fip-mt7981_cudy_tr3000-v1_SP2-Yuzhii-dhcpd-fixed-parts 的 192.168.1.1 網頁直刷，U-Boot 會將 .tar 原始位元組直接寫入 NAND ubi 分區，
-          # 導致開機時 ubi part ubi 找不到 UBI# (0x55424923) 標頭而無限重啟退回 192.168.1.1！
-          # 此處將 sysupgrade-tar 修正為 append-ubi | check-size，讓編譯器透過 ubinize 原生輸出真正的 UBI# (.bin) 韌體，同時相容 Yuzhii U-Boot 直刷與 LuCI 升級！
-          if [ -f "$FILOGIC_MK" ]; then
-            sed -i '/define Device\/cudy_tr3000-v1$/,/^endef$/ s/sysupgrade-tar/append-ubi | check-size/' "$FILOGIC_MK"
-            echo "=== 已修正 cudy_tr3000-v1 打包配方為 append-ubi (原生 UBI# .bin) ==="
-            sed -n '/define Device\/cudy_tr3000-v1$/,/^endef$/p' "$FILOGIC_MK"
-          fi
+          filogic_mk = "target/linux/mediatek/image/filogic.mk"
+
+          # =========================================================================
+          # 1. Cudy TR3000 v1 (SPI-NAND 128MB):
+          #    對應 fip-mt7981_cudy_tr3000-v1_SP2-Yuzhii-dhcpd-fixed-parts
+          #    - 將 DTS 中 ubi 分區由預設 64MB (0x4000000) 修正為 112MB (0x7000000)
+          #    - 將 filogic.mk 中 IMAGE_SIZE 設為 114688k，並將 sysupgrade-tar 改為 append-ubi | check-size
+          # =========================================================================
+          for dts_file in glob.glob("target/linux/mediatek/dts/*cudy-tr3000-v1*.dts*"):
+              with open(dts_file, "r", encoding="utf-8") as f:
+                  s = f.read()
+              if "0x4000000" in s:
+                  s = s.replace("reg = <0x5c0000 0x4000000>;", "reg = <0x5c0000 0x7000000>;")
+                  with open(dts_file, "w", encoding="utf-8") as f:
+                      f.write(s)
+                  print(f"[cudy_tr3000-v1] 已將 {dts_file} 的 ubi 分區大小修正為 112M (0x7000000)")
+
+          # =========================================================================
+          # 2. CMCC RAX3000M eMMC & JDCloud RE-CP-03 (eMMC 設備):
+          #    對應 fip-mt7981_cmcc_rax3000m-emmc_SP2-Yuzhii-dhcpd 與 fip-mt7986_jdcloud_re-cp-03_SP2-Yuzhii-dhcpd
+          #    - Yuzhii eMMC U-Boot (bootmenu_mmc.c) 採用標準 GPT 雙分區 (kernel + rootfs) 並刷入 sysupgrade-tar (.bin)
+          #    - 官方 openwrt-25.12 預設將此兩款設為單一 production 分區的 uImage.FIT (.itb)，且 RAX3000M 的 &mmc0 放在 .dtso
+          #    - 以下自動將 mt7981b-cmcc-rax3000m-emmc.dtso 合併進主 DTS，並修正兩台設備的 DTS 分區掛載與 .bin 打包配方
+          # =========================================================================
+          def extract_dtso_to_dts(dtso_text):
+              # 先移除單分區 uImage.FIT 專用的 rootdisk 引用
+              dtso_text = re.sub(r'^\s*rootdisk\s*=\s*<&[^>]+>;\s*\n?', '', dtso_text, flags=re.M)
+              out = []
+              pos = 0
+              while True:
+                  m = re.search(r'fragment@\d+\s*\{', dtso_text[pos:])
+                  if not m:
+                      break
+                  start = pos + m.end()
+                  depth = 1
+                  i = start
+                  while i < len(dtso_text) and depth > 0:
+                      if dtso_text[i] == '{':
+                          depth += 1
+                      elif dtso_text[i] == '}':
+                          depth -= 1
+                      i += 1
+                  frag_body = dtso_text[start:i-1]
+                  pos = i
+                  t_m = re.search(r'target\s*=\s*<(&[a-zA-Z0-9_]+)>;', frag_body)
+                  tp_m = re.search(r'target-path\s*=\s*"([^"]+)";', frag_body)
+                  o_m = re.search(r'__overlay__\s*\{', frag_body)
+                  if o_m:
+                      o_start = o_m.end()
+                      o_depth = 1
+                      j = o_start
+                      while j < len(frag_body) and o_depth > 0:
+                          if frag_body[j] == '{':
+                              o_depth += 1
+                          elif frag_body[j] == '}':
+                              o_depth -= 1
+                          j += 1
+                      overlay_body = frag_body[o_start:j-1]
+                      if not overlay_body.strip():
+                          continue
+                      if t_m and t_m.group(1) != "&chosen":
+                          out.append(f"\n{t_m.group(1)} {{{overlay_body}}};\n")
+                      elif (t_m and t_m.group(1) == "&chosen") or (tp_m and tp_m.group(1) == "/chosen"):
+                          out.append(f"\n/ {{\n\tchosen {{{overlay_body}}};\n}};\n")
+                      elif tp_m and tp_m.group(1) == "/":
+                          out.append(f"\n/ {{{overlay_body}}};\n")
+              return "".join(out)
+
+          rax_dts = "target/linux/mediatek/dts/mt7981b-cmcc-rax3000m.dts"
+          rax_dtso = "target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-emmc.dtso"
+          if os.path.exists(rax_dts) and os.path.exists(rax_dtso):
+              with open(rax_dts, "r", encoding="utf-8") as f:
+                  dts_content = f.read()
+              with open(rax_dtso, "r", encoding="utf-8") as f:
+                  dtso_content = f.read()
+              if "&mmc0" not in dts_content and "fragment@" in dtso_content:
+                  merged_nodes = extract_dtso_to_dts(dtso_content)
+                  dts_content = dts_content + "\n/* Merged from mt7981b-cmcc-rax3000m-emmc.dtso for Yuzhii bl-mt798x-dhcpd */\n" + merged_nodes
+                  with open(rax_dts, "w", encoding="utf-8") as f:
+                      f.write(dts_content)
+                  print(f"[cmcc_rax3000m-emmc] 已將 {rax_dtso} 的 &mmc0 節點合併至 {rax_dts}")
+
+          for emmc_dts in [rax_dts, "target/linux/mediatek/dts/mt7986a-jdcloud-re-cp-03.dts"]:
+              if os.path.exists(emmc_dts):
+                  with open(emmc_dts, "r", encoding="utf-8") as f:
+                      s = f.read()
+                  s = s.replace('block-partition-production', 'block-partition-rootfs')
+                  s = s.replace('partname = "production"', 'partname = "rootfs"')
+                  s = re.sub(r'^\s*rootdisk\s*=\s*<&[^>]+>;\s*\n?', '', s, flags=re.M)
+                  s = re.sub(r'^\s*bootargs(-override|-append)?\s*=\s*"[^"]*";\s*\n?', '', s, flags=re.M)
+                  s = re.sub(
+                      r'(chosen\s*\{)',
+                      r'\1\n\t\tbootargs = "console=ttyS0,115200n1 loglevel=8 earlycon=uart8250,mmio32,0x11002000 root=PARTLABEL=rootfs rootwait";',
+                      s,
+                      count=1
+                  )
+                  with open(emmc_dts, "w", encoding="utf-8") as f:
+                      f.write(s)
+                  print(f"[eMMC DTS] 已修正 {emmc_dts} 掛載分區為 root=PARTLABEL=rootfs")
+
+          # =========================================================================
+          # 3. 修正 filogic.mk 中三台設備的編譯與鏡像打包配方 (統一輸出原生 .bin)
+          # =========================================================================
+          if os.path.exists(filogic_mk):
+              with open(filogic_mk, "r", encoding="utf-8") as f:
+                  mk = f.read()
+
+              def patch_cudy(m):
+                  blk = m.group(0)
+                  blk = blk.replace("IMAGE_SIZE := 65536k", "IMAGE_SIZE := 114688k")
+                  blk = blk.replace("sysupgrade-tar", "append-ubi | check-size")
+                  return blk
+
+              mk = re.sub(r'define Device/cudy_tr3000-v1\b.*?^endef', patch_cudy, mk, flags=re.S | re.M)
+
+              def patch_emmc_dev(m):
+                  blk = m.group(0)
+                  if "IMAGES := sysupgrade.itb" not in blk:
+                      return blk
+                  lines = []
+                  skip_cont = False
+                  for line in blk.splitlines():
+                      if skip_cont:
+                          if not line.rstrip().endswith("\\"):
+                              skip_cont = False
+                          continue
+                      if re.match(r'^\s*(DEVICE_DTS_OVERLAY|DEVICE_DTS_LOADADDR|KERNEL|KERNEL_INITRAMFS|KERNEL_INITRAMFS_SUFFIX|IMAGES|IMAGE_SIZE|IMAGE/sysupgrade\.itb|ARTIFACTS|ARTIFACT/|COMPAT_VERSION|COMPAT_MESSAGE|UBOOTENV_IN_UBI|KERNEL_IN_UBI)\b', line):
+                          if line.rstrip().endswith("\\"):
+                              skip_cont = True
+                          continue
+                      if line.strip() == "endef":
+                          lines.append("  KERNEL := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb")
+                          lines.append("  KERNEL_INITRAMFS := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k")
+                          lines.append("  IMAGES := sysupgrade.bin")
+                          lines.append("  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata")
+                      lines.append(line)
+                  return "\n".join(lines)
+
+              mk = re.sub(r'define Device/cmcc_rax3000m\b.*?^endef', patch_emmc_dev, mk, flags=re.S | re.M)
+              mk = re.sub(r'define Device/jdcloud_re-cp-03\b.*?^endef', patch_emmc_dev, mk, flags=re.S | re.M)
+
+              with open(filogic_mk, "w", encoding="utf-8") as f:
+                  f.write(mk)
+              print("[filogic.mk] 已完成 cudy_tr3000-v1 (112M UBI# .bin) 與 cmcc_rax3000m / jdcloud_re-cp-03 (eMMC .bin) 配方修正")
+
+          # =========================================================================
+          # 4. 修正 platform.sh 與 base-files，確保 LuCI 網頁升級與 eMMC Factory MAC/Wi-Fi 校準正常運作
+          # =========================================================================
+          plat_sh = "target/linux/mediatek/filogic/base-files/lib/upgrade/platform.sh"
+          if os.path.exists(plat_sh):
+              with open(plat_sh, "r", encoding="utf-8") as f:
+                  ps = f.read()
+              # 從 fit_do_upgrade / fit_check_image 等舊清單移除 cmcc,rax3000m 與 jdcloud,re-cp-03
+              ps = re.sub(r'^\s*(cmcc,rax3000m|jdcloud,re-cp-03)\|\\\n', '', ps, flags=re.M)
+              ps = ps.replace('CI_KERNPART="production"', 'CI_KERNPART="kernel"\n\t\tCI_ROOTPART="rootfs"')
+              # 將兩台 eMMC 設備加入 CI_KERNPART="kernel" + CI_ROOTPART="rootfs" 的 emmc_do_upgrade 分支
+              ps = re.sub(
+                  r'(acer,predator-w6\|\\\n)',
+                  r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03|\\\n\1',
+                  ps,
+                  count=1
+              )
+              # 在 platform_copy_config 中確保升級保留設定生效
+              ps = re.sub(
+                  r'(\t[^\n]+\|\\\n\t[^\n]+\)\n\t\temmc_copy_config)',
+                  r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03|\\\n\1',
+                  ps,
+                  count=1
+              )
+              # 在 platform_check_image 中允許 .bin (sysupgrade-tar) 通過校驗
+              if 'nand_do_platform_check' in ps:
+                  ps = re.sub(
+                      r'(\*\)\n\t\tnand_do_platform_check)',
+                      r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03)\n\t\treturn 0\n\t\t;;\n\t\1',
+                      ps,
+                      count=1
+                  )
+              with open(plat_sh, "w", encoding="utf-8") as f:
+                  f.write(ps)
+              print("[platform.sh] 已修正 cmcc,rax3000m 與 jdcloud,re-cp-03 的 eMMC kernel/rootfs 升級邏輯")
+
+          for bf in [
+              "target/linux/mediatek/filogic/base-files/etc/board.d/02_network",
+              "target/linux/mediatek/filogic/base-files/etc/hotplug.d/firmware/11-mt76-caldata",
+              "target/linux/mediatek/filogic/base-files/etc/hotplug.d/ieee80211/11_fix_wifi_mac",
+              "package/boot/uboot-envtools/files/mediatek_filogic",
+              plat_sh,
+          ]:
+              if os.path.exists(bf):
+                  with open(bf, "r", encoding="utf-8") as f:
+                      c = f.read()
+                  if "/dev/mmc*)" in c:
+                      c = c.replace("/dev/mmc*)", '/dev/mmc*|PARTLABEL=*|"")')
+                      with open(bf, "w", encoding="utf-8") as f:
+                          f.write(c)
+                      print(f"[base-files] 已擴展 {bf} 的 eMMC root=PARTLABEL=rootfs 匹配規則")
+          PYEOF
 
       - name: 安裝外部擴充套件與更新來源 (Install Extra Feeds & Plugins)
         working-directory: ./openwrt
@@ -344,11 +530,17 @@ jobs:
           echo "CONFIG_DEVEL=y" >> .config
           echo "CONFIG_CCACHE=y" >> .config
 
-          # 基礎系統本地化、MTD 解鎖模組、UBI 工具、HTTPS 憑證與 LuCI 界面配置
+          # 基礎系統本地化、MTD/UBI 與 eMMC 分區掛載工具、HTTPS 憑證與 LuCI 界面配置
           echo "CONFIG_PACKAGE_default-settings-chn=y" >> .config
           echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
           echo "CONFIG_PACKAGE_kmod-mtd-rw=y" >> .config
           echo "CONFIG_PACKAGE_ubi-utils=y" >> .config
+          echo "CONFIG_PACKAGE_e2fsprogs=y" >> .config
+          echo "CONFIG_PACKAGE_f2fsck=y" >> .config
+          echo "CONFIG_PACKAGE_mkf2fs=y" >> .config
+          echo "CONFIG_PACKAGE_fdisk=y" >> .config
+          echo "CONFIG_PACKAGE_partx-utils=y" >> .config
+          echo "CONFIG_PACKAGE_losetup=y" >> .config
           echo "CONFIG_PACKAGE_ca-bundle=y" >> .config
           echo "CONFIG_PACKAGE_curl=y" >> .config
           echo "CONFIG_PACKAGE_luci=y" >> .config
@@ -408,39 +600,14 @@ jobs:
           fi
           df -hT
 
-      - name: 編譯韌體並為 cudy_tr3000-v1 同步生成 64M 與 112M 雙分區 UBI# (.bin) 鏡像
+      - name: 編譯韌體 (Compile Firmware)
         working-directory: ./openwrt
         run: |
           echo "$(nproc) 執行緒開始編譯..."
           make -j$(nproc) || make -j1 V=s
-
-          # 若目標為 cudy_tr3000-v1，先暫存 64M 標準分區版 .bin，再用 10 秒快速打包一份 112M 擴容分區版 .bin
-          # 確保無論 Yuzhii fixed-parts U-Boot 內部定義為 64M (0x4000000) 或 112M (0x7000000) 均有對應的原生 UBI# (.bin) 可刷！
-          TARGET_DIR=$(find bin/targets -mindepth 2 -maxdepth 2 -type d | head -n 1)
-          CUDY_DTS="target/linux/mediatek/dts/mt7981b-cudy-tr3000-v1.dts"
-          FILOGIC_MK="target/linux/mediatek/image/filogic.mk"
-
-          if [ "${{ matrix.target }}" = "cudy_tr3000-v1" ] && [ -f "$CUDY_DTS" ] && grep -q "0x4000000" "$CUDY_DTS"; then
-            for f in "$TARGET_DIR"/*cudy_tr3000-v1*squashfs-sysupgrade.bin; do
-              if [ -f "$f" ]; then
-                cp -f "$f" "${f%-squashfs-sysupgrade.bin}-64M-squashfs-sysupgrade.bin"
-              fi
-            done
-
-            echo "正在為 cudy_tr3000-v1 額外封裝 112M 大分區 (0x7000000) 原生 UBI# .bin 鏡像..."
-            sed -i 's/reg = <0x5c0000 0x4000000>;/reg = <0x5c0000 0x7000000>;/g' "$CUDY_DTS"
-            sed -i '/define Device\/cudy_tr3000-v1$/,/^endef$/ s/IMAGE_SIZE := 65536k/IMAGE_SIZE := 114688k/' "$FILOGIC_MK"
-            make target/linux/install -j$(nproc)
-
-            for f in "$TARGET_DIR"/*cudy_tr3000-v1-squashfs-sysupgrade.bin; do
-              if [ -f "$f" ]; then
-                mv -f "$f" "${f%-squashfs-sysupgrade.bin}-112M-squashfs-sysupgrade.bin"
-              fi
-            done
-          fi
           df -hT
 
-      - name: 整理、驗證 UBI#/FIT 標頭並重新命名韌體 (Organize & Verify Firmware)
+      - name: 整理、驗證標頭並重新命名韌體 (Organize & Verify Firmware)
         id: organize
         run: |
           cd openwrt
@@ -474,43 +641,39 @@ jobs:
           cd "$TARGET_DIR"
           shopt -s nullglob
           COUNT=0
-          # 嚴格保留編譯器原生生成的副檔名 (${EXT})，並校驗二進位魔數標頭
-          for file in *.bin *.itb; do
+          # 三台設備均已適配輸出為原生 .bin (squashfs-sysupgrade.bin)
+          for file in *.bin; do
             if [ ! -f "$file" ]; then
               continue
             fi
             lower_file=$(echo "$file" | tr '[:upper:]' '[:lower:]')
             if [[ "$lower_file" =~ squashfs-sysupgrade ]]; then
-              EXT="${file##*.}"
               MAGIC_HEX=$(xxd -p -l 4 "$file" 2>/dev/null || true)
               echo "檢查韌體 [$file] 前 4 位元組魔數標頭: 0x${MAGIC_HEX}"
-              if [ "$MAGIC_HEX" = "73797375" ]; then
-                echo "::error::韌體 [$file] 仍為 sysupgrade-tar (.tar) 歸檔格式 (0x73797375)，無法在 Yuzhii U-Boot 網頁直刷！"
+
+              # 針對 SPI-NAND 設備 (cudy_tr3000-v1)，驗證必須為 UBI# (0x55424923)
+              if [ "$DEV_NAME" = "cudy_tr3000-v1" ] && [ "$MAGIC_HEX" != "55424923" ]; then
+                echo "::error::cudy_tr3000-v1 韌體 [$file] 標頭 (0x${MAGIC_HEX}) 非 UBI# (0x55424923)，無法在 Yuzhii U-Boot 網頁直刷！"
                 exit 1
               fi
 
-              if [[ "$lower_file" =~ -64m-squashfs-sysupgrade ]]; then
-                NEW_NAME="${DEV_NAME}-64M-${IMG_VERSION}-squashfs-sysupgrade-${PLUGIN_NUM}.${EXT}"
-              elif [[ "$lower_file" =~ -112m-squashfs-sysupgrade ]]; then
-                NEW_NAME="${DEV_NAME}-112M-${IMG_VERSION}-squashfs-sysupgrade-${PLUGIN_NUM}.${EXT}"
-              else
-                NEW_NAME="${DEV_NAME}-${IMG_VERSION}-squashfs-sysupgrade-${PLUGIN_NUM}.${EXT}"
+              # 針對 eMMC 設備 (jdcloud_re-cp-03 與 cmcc_rax3000m-emmc)，驗證必須為 sysupgrade-tar (0x73797375)
+              if [ "$DEV_NAME" != "cudy_tr3000-v1" ] && [ "$MAGIC_HEX" != "73797375" ]; then
+                echo "::error::eMMC 設備 ($DEV_NAME) 韌體 [$file] 標頭 (0x${MAGIC_HEX}) 非 sysupgrade-tar (0x73797375)！"
+                exit 1
               fi
 
+              NEW_NAME="${DEV_NAME}-${IMG_VERSION}-squashfs-sysupgrade-${PLUGIN_NUM}.bin"
               echo "命名歸檔: $file (Header: 0x${MAGIC_HEX}) ->$NEW_NAME"
               cp -f "$file" "$GITHUB_WORKSPACE/collected_firmware/$NEW_NAME"
               COUNT=$((COUNT + 1))
-            elif [[ "$lower_file" =~ -gpt\.bin$ ]]; then
-              GPT_NAME="${DEV_NAME}-${IMG_VERSION}-gpt.bin"
-              cp -f "$file" "$GITHUB_WORKSPACE/collected_firmware/$GPT_NAME"
-              echo "附帶歸檔 eMMC GPT 分區表: $file ->$GPT_NAME"
             else
               echo "跳過非 sysupgrade 檔案: $file"
             fi
           done
 
           if [ "$COUNT" -eq 0 ]; then
-            echo "::error::未找到符合條件的 squashfs-sysupgrade 韌體！"
+            echo "::error::未找到符合條件的 squashfs-sysupgrade.bin 韌體！"
             ls -la
             exit 1
           fi
@@ -546,37 +709,36 @@ jobs:
 
           cd all_firmwares
           shopt -s nullglob
-          FW_FILES=(*.bin *.itb)
+          FW_FILES=(*.bin)
           if [ "${#FW_FILES[@]}" -gt 0 ]; then
             sha256sum "${FW_FILES[@]}" > sha256sums.txt
           else
-            echo "::error::all_firmwares 目錄中未找到任何韌體檔案！"
+            echo "::error::all_firmwares 目錄中未找到任何 .bin 韌體檔案！"
             exit 1
           fi
           cd ..
 
           cat > release_notes.md << EOF
-          ## 🚀 ImmortalWrt 多設備純淨自編韌體發布 (專為 Yuzhii0718 SP2 DHCPD U-Boot 適配)
+          ## 🚀 ImmortalWrt 多設備純淨自編韌體發布 (專為 Yuzhii0718 bl-mt798x-dhcpd U-Boot 適配)
 
           - **建置時間**: \`${BUILD_TIME}\`
           - **建置編號**: \`#${{ github.run_number }}\`
-          - **支援設備**: \`cudy_tr3000-v1\`（同時提供 64M 與 112M 原生 \`UBI#\` \`.bin\`）、\`jdcloud_re-cp-03\`、\`cmcc_rax3000m-emmc\`
+          - **支援設備**:
+            - \`cudy_tr3000-v1\`（112M 大分區原生 \`UBI#\` \`.bin\`，適配 \`fip-mt7981_cudy_tr3000-v1_SP2-Yuzhii-dhcpd-fixed-parts\`）
+            - \`jdcloud_re-cp-03\`（eMMC 雙分區 \`kernel\`+\`rootfs\` 原生 \`.bin\`，適配 \`fip-mt7986_jdcloud_re-cp-03_SP2-Yuzhii-dhcpd\`）
+            - \`cmcc_rax3000m-emmc\`（eMMC 雙分區 \`kernel\`+\`rootfs\` 原生 \`.bin\`，適配 \`fip-mt7981_cmcc_rax3000m-emmc_SP2-Yuzhii-dhcpd\`）
           - **預設管理地址**: \`http://192.168.7.1\`（root 無密碼）
           - **預設主題**: Argon
 
-          ---
-
           ### 📦 插件版本說明
-          - **3 插件精簡版** (\`-3.bin\` / \`-3.itb\`)：
+          - **3 插件精簡版** (\`-3.bin\`)：
             1. \`luci-theme-argon\`（純淨主題）
             2. \`luci-app-ttyd\`（Web 終端機）
             3. \`luci-app-ddns\` + \`ddns-scripts\` + \`ddns-scripts-services\`（完整 DDNS 動態域名）
-          - **5 插件進階版** (\`-5.bin\` / \`-5.itb\`)：
+          - **5 插件進階版** (\`-5.bin\`)：
             - 包含 3 插件版全部內容
             4. \`luci-app-nikki\`：已預置 \`vernesong/mihomo\` 官方最新 **Alpha-Smart** 核心（\`/usr/libexec/mihomo\`）
             5. \`luci-app-rtp2httpd\` + \`rtp2httpd\`：完整 IPTV 串流轉換服務與 LuCI 管理介面
-
-          ---
 
           ### 📂 發布檔案下載清單與 SHA256 校驗碼
           \`\`\`text
@@ -592,7 +754,6 @@ jobs:
           body_path: release_notes.md
           files: |
             all_firmwares/*.bin
-            all_firmwares/*.itb
             all_firmwares/sha256sums.txt
           token: ${{ secrets.GITHUB_TOKEN }}
           generate_release_notes: false
