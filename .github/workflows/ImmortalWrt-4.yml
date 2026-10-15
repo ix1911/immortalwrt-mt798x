@@ -1,4 +1,4 @@
-name: ImmortalWrt 自動追蹤最新正式版与快照版 (專為 Yuzhii0718 bl-mt798x-dhcpd U-Boot 三設備全適配版)
+name: ImmortalWrt 自動追蹤最新正式版与快照版 (第四版 编译最新的三个版本 和 最新的一个 SNAPSHOT 版本，默认为最新稳定版)
 
 on:
   workflow_dispatch:
