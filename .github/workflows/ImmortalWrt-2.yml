@@ -1,4 +1,4 @@
-name: ImmortalWrt 25.12 (Gemini 第二版)
+name: ImmortalWrt 25.12 (Gemini 第二版 ImmortalWrt 25.12-SNAPSHOT 修复sftp&更新源 情况未知)
 
 on:
   workflow_dispatch:
