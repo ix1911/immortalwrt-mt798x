@@ -141,15 +141,12 @@ jobs:
         working-directory: ./openwrt
         run: |
           python3 - << 'PYEOF'
-          import os, re, glob
-
-          filogic_mk = "target/linux/mediatek/image/filogic.mk"
+          import os, re, glob, sys
 
           # =========================================================================
           # 1. Cudy TR3000 v1 (SPI-NAND 128MB):
           #    對應 fip-mt7981_cudy_tr3000-v1_SP2-Yuzhii-dhcpd-fixed-parts
           #    - 將 DTS 中 ubi 分區由預設 64MB (0x4000000) 修正為 112MB (0x7000000)
-          #    - 將 filogic.mk 中 IMAGE_SIZE 設為 114688k，並將 sysupgrade-tar 改為 append-ubi | check-size
           # =========================================================================
           for dts_file in glob.glob("target/linux/mediatek/dts/*cudy-tr3000-v1*.dts*"):
               with open(dts_file, "r", encoding="utf-8") as f:
@@ -164,8 +161,7 @@ jobs:
           # 2. CMCC RAX3000M eMMC & JDCloud RE-CP-03 (eMMC 設備):
           #    對應 fip-mt7981_cmcc_rax3000m-emmc_SP2-Yuzhii-dhcpd 與 fip-mt7986_jdcloud_re-cp-03_SP2-Yuzhii-dhcpd
           #    - Yuzhii eMMC U-Boot (bootmenu_mmc.c) 採用標準 GPT 雙分區 (kernel + rootfs) 並刷入 sysupgrade-tar (.bin)
-          #    - 官方 openwrt-25.12 預設將此兩款設為單一 production 分區的 uImage.FIT (.itb)，且 RAX3000M 的 &mmc0 放在 .dtso
-          #    - 以下自動將 mt7981b-cmcc-rax3000m-emmc.dtso 合併進主 DTS，並修正兩台設備的 DTS 分區掛載與 .bin 打包配方
+          #    - 自動將 mt7981b-cmcc-rax3000m-emmc.dtso 合併進主 DTS，並修正兩台設備的 DTS 分區掛載為 root=PARTLABEL=rootfs
           # =========================================================================
           def extract_dtso_to_dts(dtso_text):
               dtso_text = re.sub(r'^\s*rootdisk\s*=\s*<&[^>]+>;\s*\n?', '', dtso_text, flags=re.M)
@@ -247,52 +243,109 @@ jobs:
                   print(f"[eMMC DTS] 已修正 {emmc_dts} 掛載分區為 root=PARTLABEL=rootfs")
 
           # =========================================================================
-          # 3. 修正 filogic.mk 中三台設備的編譯與鏡像打包配方 (統一輸出原生 .bin)
+          # 3. 採用狀態機逐行解析並無條件覆寫 target/linux/mediatek/image/*.mk 中三台設備配方
+          #    徹底杜絕因共用宏 (如 cmcc_rax3000m-common) 繼承導致仍產出 .itb 的問題！
           # =========================================================================
-          if os.path.exists(filogic_mk):
-              with open(filogic_mk, "r", encoding="utf-8") as f:
-                  mk = f.read()
+          SKIP_KEYS = (
+              "DEVICE_DTS_OVERLAY",
+              "DEVICE_DTS_LOADADDR",
+              "KERNEL",
+              "KERNEL_INITRAMFS",
+              "KERNEL_INITRAMFS_SUFFIX",
+              "IMAGES",
+              "IMAGE_SIZE",
+              "IMAGE/sysupgrade.itb",
+              "IMAGE/sysupgrade.bin",
+              "ARTIFACTS",
+              "ARTIFACT/",
+              "COMPAT_VERSION",
+              "COMPAT_MESSAGE",
+              "UBOOTENV_IN_UBI",
+              "KERNEL_IN_UBI",
+          )
 
-              def patch_cudy(m):
-                  blk = m.group(0)
-                  blk = blk.replace("IMAGE_SIZE := 65536k", "IMAGE_SIZE := 114688k")
-                  blk = blk.replace("sysupgrade-tar", "append-ubi | check-size")
-                  print("=== Patched Device/cudy_tr3000-v1 ===\n" + blk)
-                  return blk
+          total_patched = []
+          for mk_path in glob.glob("target/linux/mediatek/image/*.mk"):
+              with open(mk_path, "r", encoding="utf-8") as f:
+                  raw_lines = f.read().splitlines()
 
-              mk = re.sub(r'^define Device/cudy_tr3000-v1\b.*?^endef', patch_cudy, mk, flags=re.S | re.M)
+              out_lines = []
+              in_mode = None
+              dev_name = ""
+              skip_cont = False
+              patched_in_file = []
 
-              def patch_emmc_dev(m):
-                  blk = m.group(0)
-                  if "sysupgrade.itb" not in blk:
-                      return blk
-                  lines = []
-                  skip_cont = False
-                  for line in blk.splitlines():
+              for line in raw_lines:
+                  stripped = line.strip()
+                  m_def = re.match(r'^define\s+Device/([a-zA-Z0-9_-]+)', stripped)
+                  if m_def and in_mode is None:
+                      dname = m_def.group(1)
+                      if dname == "cudy_tr3000-v1":
+                          in_mode = "cudy"
+                          dev_name = dname
+                          out_lines.append(line)
+                          continue
+                      elif dname.startswith("cmcc_rax3000m") or dname.startswith("jdcloud_re-cp-03"):
+                          in_mode = "emmc"
+                          dev_name = dname
+                          skip_cont = False
+                          out_lines.append(line)
+                          continue
+
+                  if in_mode == "cudy":
+                      if stripped == "endef":
+                          in_mode = None
+                          patched_in_file.append(dev_name)
+                          out_lines.append(line)
+                          continue
+                      line = line.replace("IMAGE_SIZE := 65536k", "IMAGE_SIZE := 114688k")
+                      line = line.replace("sysupgrade-tar", "append-ubi | check-size")
+                      out_lines.append(line)
+                      continue
+
+                  if in_mode == "emmc":
+                      if stripped == "endef":
+                          out_lines.append("  DEVICE_DTS_OVERLAY :=")
+                          out_lines.append("  KERNEL_IN_UBI :=")
+                          out_lines.append("  UBOOTENV_IN_UBI :=")
+                          out_lines.append("  ARTIFACTS :=")
+                          out_lines.append("  KERNEL := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb")
+                          out_lines.append("  KERNEL_INITRAMFS := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k")
+                          out_lines.append("  KERNEL_INITRAMFS_SUFFIX := -kernel.bin")
+                          out_lines.append("  IMAGES := sysupgrade.bin")
+                          out_lines.append("  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata")
+                          out_lines.append(line)
+                          in_mode = None
+                          skip_cont = False
+                          patched_in_file.append(dev_name)
+                          continue
+
                       if skip_cont:
-                          if not line.rstrip().endswith("\\"):
+                          if not stripped.endswith("\\"):
                               skip_cont = False
                           continue
-                      if re.match(r'^\s*(DEVICE_DTS_OVERLAY|DEVICE_DTS_LOADADDR|KERNEL|KERNEL_INITRAMFS|KERNEL_INITRAMFS_SUFFIX|IMAGES|IMAGE_SIZE|IMAGE/sysupgrade\.itb|ARTIFACTS|ARTIFACT/|COMPAT_VERSION|COMPAT_MESSAGE|UBOOTENV_IN_UBI|KERNEL_IN_UBI)\b', line):
-                          if line.rstrip().endswith("\\"):
+
+                      tokens = stripped.split()
+                      first_tok = tokens[0] if tokens else ""
+                      if any(first_tok == k or first_tok.startswith("ARTIFACT/") for k in SKIP_KEYS):
+                          if stripped.endswith("\\"):
                               skip_cont = True
                           continue
-                      if line.strip() == "endef":
-                          lines.append("  KERNEL := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb")
-                          lines.append("  KERNEL_INITRAMFS := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k")
-                          lines.append("  IMAGES := sysupgrade.bin")
-                          lines.append("  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata")
-                      lines.append(line)
-                  res = "\n".join(lines)
-                  print("=== Patched eMMC Device ===\n" + res)
-                  return res
 
-              mk = re.sub(r'^define Device/cmcc_rax3000m\b.*?^endef', patch_emmc_dev, mk, flags=re.S | re.M)
-              mk = re.sub(r'^define Device/jdcloud_re-cp-03\b.*?^endef', patch_emmc_dev, mk, flags=re.S | re.M)
+                      out_lines.append(line)
+                      continue
 
-              with open(filogic_mk, "w", encoding="utf-8") as f:
-                  f.write(mk)
-              print("[filogic.mk] 已完成 cudy_tr3000-v1 (112M UBI# .bin) 與 cmcc_rax3000m / jdcloud_re-cp-03 (eMMC .bin) 配方修正")
+                  out_lines.append(line)
+
+              if patched_in_file:
+                  with open(mk_path, "w", encoding="utf-8") as f:
+                      f.write("\n".join(out_lines) + "\n")
+                  total_patched.extend(patched_in_file)
+                  print(f"[filogic.mk] 已於 {mk_path} 成功覆寫設備區塊: {patched_in_file}")
+
+          if not total_patched:
+              print("::error::未能在 target/linux/mediatek/image/*.mk 找到目標設備定義！", file=sys.stderr)
+              sys.exit(1)
 
           # =========================================================================
           # 4. 修正 platform.sh 與 base-files，確保 LuCI 網頁升級與 eMMC Factory MAC/Wi-Fi 校準正常運作
@@ -301,24 +354,20 @@ jobs:
           if os.path.exists(plat_sh):
               with open(plat_sh, "r", encoding="utf-8") as f:
                   ps = f.read()
-              # 從 fit_do_upgrade / fit_check_image 等舊清單移除 cmcc,rax3000m 與 jdcloud,re-cp-03
               ps = re.sub(r'^\s*(cmcc,rax3000m|jdcloud,re-cp-03)\|\\\n', '', ps, flags=re.M)
               ps = ps.replace('CI_KERNPART="production"', 'CI_KERNPART="kernel"\n\t\tCI_ROOTPART="rootfs"')
-              # 將兩台 eMMC 設備加入 CI_KERNPART="kernel" + CI_ROOTPART="rootfs" 的 emmc_do_upgrade 分支
               ps = re.sub(
                   r'(acer,predator-w6\|\\\n)',
                   r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03|\\\n\1',
                   ps,
                   count=1
               )
-              # 在 platform_copy_config 中確保升級保留設定生效
               ps = re.sub(
                   r'(\t[^\n]+\|\\\n\t[^\n]+\)\n\t\temmc_copy_config)',
                   r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03|\\\n\1',
                   ps,
                   count=1
               )
-              # 在 platform_check_image 中允許 .bin (sysupgrade-tar) 通過校驗
               if 'nand_do_platform_check' in ps:
                   ps = re.sub(
                       r'(\*\)\n\t\tnand_do_platform_check)',
@@ -347,6 +396,11 @@ jobs:
                       print(f"[base-files] 已擴展 {bf} 的 eMMC root=PARTLABEL=rootfs 匹配規則")
           PYEOF
 
+          echo "=== 驗證修改後的 filogic.mk 設備定義 ==="
+          sed -n '/^define Device\/cmcc_rax3000m/,/^endef/p' target/linux/mediatek/image/*.mk
+          sed -n '/^define Device\/jdcloud_re-cp-03/,/^endef/p' target/linux/mediatek/image/*.mk
+          sed -n '/^define Device\/cudy_tr3000-v1/,/^endef/p' target/linux/mediatek/image/*.mk
+
       - name: 安裝外部擴充套件與更新來源 (Install Extra Feeds & Plugins)
         working-directory: ./openwrt
         run: |
@@ -365,7 +419,7 @@ jobs:
             fi
           done
 
-          # === 3：保護自訂 mihomo 核心不被 OpenWrt rstrip.sh 剝離符號破壞 ===
+          # === 階段 3：保護自訂 mihomo 核心不被 OpenWrt rstrip.sh 剝離符號破壞 ===
           if [ -f scripts/rstrip.sh ]; then
             sed -i 's/find \$TARGETS -type f/find \$TARGETS -type f ! -name "mihomo*"/g' scripts/rstrip.sh
           fi
@@ -499,13 +553,14 @@ jobs:
       - name: 自動生成編譯設定 (Generate .config)
         working-directory: ./openwrt
         run: |
-          rm -f .config
+          # 清理可能殘留的 targetinfo 快取，強制 make defconfig 重新讀取修改後的 filogic.mk
+          rm -rf tmp .config
           touch .config
 
           echo "CONFIG_TARGET_mediatek=y" >> .config
           echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
 
-          # 關鍵修復：精準匹配 define Device/<name> 標頭，防止因其他設備 (如 cmcc_rax3000me) 的 ARTIFACT 子字串誤判而回退編譯 openwrt_one！
+          # 精準匹配 define Device/<name> 標頭，防止因其他設備的 ARTIFACT 子字串誤判而回退編譯 openwrt_one
           TARGET_PROFILE=""
           case "${{ matrix.target }}" in
             jdcloud_re-cp-03)
