@@ -168,8 +168,11 @@ jobs:
           #    - 以下自動將 mt7981b-cmcc-rax3000m-emmc.dtso 合併進主 DTS，並修正兩台設備的 DTS 分區掛載與 .bin 打包配方
           # =========================================================================
           def extract_dtso_to_dts(dtso_text):
-              # 先移除單分區 uImage.FIT 專用的 rootdisk 引用
               dtso_text = re.sub(r'^\s*rootdisk\s*=\s*<&[^>]+>;\s*\n?', '', dtso_text, flags=re.M)
+              if "fragment@" not in dtso_text:
+                  cleaned = re.sub(r'^\s*/(dts-v1|plugin)/;\s*\n?', '', dtso_text, flags=re.M)
+                  cleaned = re.sub(r'/\s*\{\s*compatible\s*=\s*[^;]+;\s*\};\s*', '', cleaned, flags=re.S)
+                  return "\n" + cleaned.strip() + "\n"
               out = []
               pos = 0
               while True:
@@ -218,7 +221,7 @@ jobs:
                   dts_content = f.read()
               with open(rax_dtso, "r", encoding="utf-8") as f:
                   dtso_content = f.read()
-              if "&mmc0" not in dts_content and "fragment@" in dtso_content:
+              if "&mmc0" not in dts_content and ("fragment@" in dtso_content or "&mmc0" in dtso_content):
                   merged_nodes = extract_dtso_to_dts(dtso_content)
                   dts_content = dts_content + "\n/* Merged from mt7981b-cmcc-rax3000m-emmc.dtso for Yuzhii bl-mt798x-dhcpd */\n" + merged_nodes
                   with open(rax_dts, "w", encoding="utf-8") as f:
@@ -254,13 +257,14 @@ jobs:
                   blk = m.group(0)
                   blk = blk.replace("IMAGE_SIZE := 65536k", "IMAGE_SIZE := 114688k")
                   blk = blk.replace("sysupgrade-tar", "append-ubi | check-size")
+                  print("=== Patched Device/cudy_tr3000-v1 ===\n" + blk)
                   return blk
 
-              mk = re.sub(r'define Device/cudy_tr3000-v1\b.*?^endef', patch_cudy, mk, flags=re.S | re.M)
+              mk = re.sub(r'^define Device/cudy_tr3000-v1\b.*?^endef', patch_cudy, mk, flags=re.S | re.M)
 
               def patch_emmc_dev(m):
                   blk = m.group(0)
-                  if "IMAGES := sysupgrade.itb" not in blk:
+                  if "sysupgrade.itb" not in blk:
                       return blk
                   lines = []
                   skip_cont = False
@@ -279,10 +283,12 @@ jobs:
                           lines.append("  IMAGES := sysupgrade.bin")
                           lines.append("  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata")
                       lines.append(line)
-                  return "\n".join(lines)
+                  res = "\n".join(lines)
+                  print("=== Patched eMMC Device ===\n" + res)
+                  return res
 
-              mk = re.sub(r'define Device/cmcc_rax3000m\b.*?^endef', patch_emmc_dev, mk, flags=re.S | re.M)
-              mk = re.sub(r'define Device/jdcloud_re-cp-03\b.*?^endef', patch_emmc_dev, mk, flags=re.S | re.M)
+              mk = re.sub(r'^define Device/cmcc_rax3000m\b.*?^endef', patch_emmc_dev, mk, flags=re.S | re.M)
+              mk = re.sub(r'^define Device/jdcloud_re-cp-03\b.*?^endef', patch_emmc_dev, mk, flags=re.S | re.M)
 
               with open(filogic_mk, "w", encoding="utf-8") as f:
                   f.write(mk)
@@ -359,7 +365,7 @@ jobs:
             fi
           done
 
-          # === 階段 3：保護自訂 mihomo 核心不被 OpenWrt rstrip.sh 剝離符號破壞 ===
+          # === 3：保護自訂 mihomo 核心不被 OpenWrt rstrip.sh 剝離符號破壞 ===
           if [ -f scripts/rstrip.sh ]; then
             sed -i 's/find \$TARGETS -type f/find \$TARGETS -type f ! -name "mihomo*"/g' scripts/rstrip.sh
           fi
@@ -499,19 +505,20 @@ jobs:
           echo "CONFIG_TARGET_mediatek=y" >> .config
           echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
 
-          # 自動偵測當前源碼樹中的設備 Profile 名稱
+          # 關鍵修復：精準匹配 define Device/<name> 標頭，防止因其他設備 (如 cmcc_rax3000me) 的 ARTIFACT 子字串誤判而回退編譯 openwrt_one！
+          TARGET_PROFILE=""
           case "${{ matrix.target }}" in
             jdcloud_re-cp-03)
-              echo "CONFIG_TARGET_mediatek_filogic_DEVICE_jdcloud_re-cp-03=y" >> .config
+              TARGET_PROFILE="jdcloud_re-cp-03"
               ;;
             cudy_tr3000-v1)
-              echo "CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-v1=y" >> .config
+              TARGET_PROFILE="cudy_tr3000-v1"
               ;;
             cmcc_rax3000m-emmc|cmcc_rax3000m)
-              if grep -q "cmcc_rax3000m-emmc" target/linux/mediatek/image/*.mk 2>/dev/null; then
-                echo "CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m-emmc=y" >> .config
+              if grep -qE '^define Device/cmcc_rax3000m-emmc([[:space:]]|$)' target/linux/mediatek/image/*.mk 2>/dev/null; then
+                TARGET_PROFILE="cmcc_rax3000m-emmc"
               else
-                echo "CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m=y" >> .config
+                TARGET_PROFILE="cmcc_rax3000m"
               fi
               ;;
             *)
@@ -519,6 +526,9 @@ jobs:
               exit 1
               ;;
           esac
+
+          echo "寫入目標設備 Profile: CONFIG_TARGET_mediatek_filogic_DEVICE_${TARGET_PROFILE}=y"
+          echo "CONFIG_TARGET_mediatek_filogic_DEVICE_${TARGET_PROFILE}=y" >> .config
 
           # 明確指定 SquashFS 韌體鏡像格式與 Preinit IP，關閉多餘鏡像格式
           echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y" >> .config
@@ -579,9 +589,10 @@ jobs:
 
           make defconfig
 
-          echo "=== 驗證目標設備與關鍵套件配置 ==="
-          if ! grep -qE '^CONFIG_TARGET_mediatek_filogic_DEVICE_.*=y' .config; then
-            echo "::error::目標設備 Profile 未成功寫入 .config，請檢查設備名稱！"
+          echo "=== 嚴格驗證目標設備 (${TARGET_PROFILE}) 與關鍵套件配置 ==="
+          if ! grep -qE "^CONFIG_TARGET_mediatek_filogic_DEVICE_${TARGET_PROFILE}=y$" .config; then
+            echo "::error::目標設備 Profile (${TARGET_PROFILE}) 未成功寫入 .config（被 defconfig 重置為其他設備）！"
+            grep -E '^CONFIG_TARGET_mediatek_filogic_DEVICE_.*=y' .config || true
             exit 1
           fi
           grep -E '^CONFIG_TARGET_mediatek_filogic_DEVICE_.*=y' .config
