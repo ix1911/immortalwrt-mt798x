@@ -1,4 +1,4 @@
-name: ImmortalWrt 25.12 (專為 Yuzhii0718 bl-mt798x-dhcpd U-Boot 三設備全適配版)
+name: ImmortalWrt 25.12 (Gemini 1015 第一版)
 
 on:
   workflow_dispatch:
