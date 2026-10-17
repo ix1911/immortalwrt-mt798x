@@ -1,4 +1,4 @@
-name: ImmortalWrt (支援 BIN 與 ITB 雙版本)
+name: ImmortalWrt 自動追蹤最新正式版与快照版 (支援 BIN 與 ITB 雙原生格式・Std 與 Pro 雙版本)
 
 on:
   workflow_dispatch:
@@ -941,6 +941,130 @@ jobs:
           COUNT=0
 
           if [ "$IMG_FMT" = "itb" ]; then
+            # === 原生 ITB 模式：僅收集原生編譯產出的 .itb，並嚴格驗證 FIT 魔數標頭必須為 0xd00dfeed ===
+            for file in *.itb; do
+              if [ ! -f "$file" ]; then
+                continue
+              fi
+              lower_file=$(echo "$file" | tr '[:upper:]' '[:lower:]')
+              if [[ "$lower_file" =~ squashfs-sysupgrade ]]; then
+                MAGIC_HEX=$(xxd -p -l 4 "$file" 2>/dev/null || true)
+                echo "檢查原生 ITB 韌體 [$file] 前 4 位元組魔數標頭: 0x${MAGIC_HEX}"
+                if [ "$MAGIC_HEX" != "d00dfeed" ]; then
+                  echo "::error::韌體 [$file] 標頭 (0x${MAGIC_HEX}) 非原生 FIT/ITB 魔數 (0xd00dfeed)！"
+                  exit 1
+                fi
+                NEW_NAME="${DEV_NAME}-${IMG_VERSION}-squashfs-sysupgrade-${EDITION}.itb"
+                echo "命名歸檔 (原生 ITB): $file (Header: 0x${MAGIC_HEX}) -> $NEW_NAME"
+                cp -f "$file" "$GITHUB_WORKSPACE/collected_firmware/$NEW_NAME"
+                COUNT=$((COUNT + 1))
+              else
+                echo "跳過非 sysupgrade 檔案: $file"
+              fi
+            done
+          else
+            # === 原生 BIN 模式 (預設)：僅收集原生編譯產出的 .bin，並嚴格驗證 UBI# (0x55424923) 或 sysupgrade-tar (0x73797375) 標頭 ===
+            for file in *.bin; do
+              if [ ! -f "$file" ]; then
+                continue
+              fi
+              lower_file=$(echo "$file" | tr '[:upper:]' '[:lower:]')
+              if [[ "$lower_file" =~ squashfs-sysupgrade ]]; then
+                MAGIC_HEX=$(xxd -p -l 4 "$file" 2>/dev/null || true)
+                echo "檢查原生 BIN 韌體 [$file] 前 4 位元組魔數標頭: 0x${MAGIC_HEX}"
+
+                if [ "$DEV_NAME" = "cudy_tr3000-v1" ] && [ "$MAGIC_HEX" != "55424923" ]; then
+                  echo "::error::cudy_tr3000-v1 韌體 [$file] 標頭 (0x${MAGIC_HEX}) 非原生 UBI# (0x55424923)！"
+                  exit 1
+                fi
+
+                if [ "$DEV_NAME" != "cudy_tr3000-v1" ] && [ "$MAGIC_HEX" != "73797375" ]; then
+                  echo "::error::eMMC 設備 ($DEV_NAME) 韌體 [$file] 標頭 (0x${MAGIC_HEX}) 非原生 sysupgrade-tar (0x73797375)！"
+                  exit 1
+                fi
+
+                NEW_NAME="${DEV_NAME}-${IMG_VERSION}-squashfs-sysupgrade-${EDITION}.bin"
+                echo "命名歸檔 (原生 BIN): $file (Header: 0x${MAGIC_HEX}) -> $NEW_NAME"
+                cp -f "$file" "$GITHUB_WORKSPACE/collected_firmware/$NEW_NAME"
+                COUNT=$((COUNT + 1))
+              else
+                echo "跳過非 sysupgrade 檔案: $file"
+              fi
+            done
+          fi
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::未找到符合條件的原生 squashfs-sysupgrade.${IMG_FMT} 韌體！"
+            ls -la
+            exit 1
+          fi
+          ls -lh "$GITHUB_WORKSPACE/collected_firmware/"
+
+      - name: 上傳本任務韌體成果 (Upload Artifact)
+        uses: actions/upload-artifact@v7
+        with:
+          name: firmware-${{ matrix.target }}-${{ matrix.variant }}-${{ env.IMG_FMT }}
+          path: collected_firmware/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: 統一發布至 Releases (Consolidated Release)
+    needs: build
+    if: ${{ success() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: 下載所有編譯成果 (Download All Artifacts)
+        uses: actions/download-artifact@v8
+        with:
+          path: all_firmwares
+          merge-multiple: true
+
+      - name: 準備發布清單與說明 (Prepare Release Notes)
+        id: prep_release
+        run: |
+          RELEASE_DATE=$(TZ=Asia/Taipei date "+%Y-%m-%d")
+          FINISH_TIME=$(TZ=Asia/Taipei date "+%Y年%m月%d日 %H時%M分")
+          RELEASE_TAG="v${RELEASE_DATE}-Build-${{ github.run_number }}"
+          echo "RELEASE_TAG=${RELEASE_TAG}" >> "$GITHUB_ENV"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+
+          cd all_firmwares
+          shopt -s nullglob
+
+          # 讀取編譯階段記錄之開編時間、上游 ImmortalWrt 源碼最後提交時間與格式，讀取後清理臨時中繼檔
+          META_FILES=(build_info_*.env)
+          if [ "${#META_FILES[@]}" -gt 0 ]; then
+            source "${META_FILES[0]}"
+            rm -f build_info_*.env
+          fi
+          BUILD_START_TIME="${BUILD_START_TIME:-${FINISH_TIME}}"
+          UPSTREAM_COMMIT_TIME="${UPSTREAM_COMMIT_TIME:-${FINISH_TIME}}"
+          UPSTREAM_COMMIT_HASH="${UPSTREAM_COMMIT_HASH:-latest}"
+          IMG_FMT="${IMG_FMT:-bin}"
+          IMG_FMT_UPPER=$(echo "$IMG_FMT" | tr '[:lower:]' '[:upper:]')
+
+          FW_FILES=(*.bin *.itb)
+          if [ "${#FW_FILES[@]}" -gt 0 ]; then
+            sha256sum "${FW_FILES[@]}" > sha256sums.txt
+            DETECTED_VER=$(echo "${FW_FILES[0]}" | sed -E 's/^.*-([0-9]+\.[0-9]+(\.[0-9]+|-SNAPSHOT)?)-squashfs-sysupgrade.*$/\1/')
+          else
+            echo "::error::all_firmwares 目錄中未找到任何 .bin 或 .itb 韌體檔案！"
+            exit 1
+          fi
+          cd ..
+
+          if [ -z "$DETECTED_VER" ]; then
+            DETECTED_VER="25.12"
+          fi
+          echo "DETECTED_VER=${DETECTED_VER}" >> "$GITHUB_ENV"
+          echo "IMG_FMT_UPPER=${IMG_FMT_UPPER}" >> "$GITHUB_ENV"
+          echo "detected_ver=${DETECTED_VER}" >> "$GITHUB_OUTPUT"
+          echo "img_fmt_upper=${IMG_FMT_UPPER}" >> "$GITHUB_OUTPUT"
+
+          if [ "$IMG_FMT" = "itb" ]; then
             FMT_DESC="遵循 OpenWrt 官方主線 FIT（Flattened Image Tree，Magic \`0xd00dfeed\`）標準規範，適配主線 U-Boot Mod（\`fitblk\`）引導環境"
             BOOT_ENV_NAND="OpenWrt U-Boot Mod (\`fitblk\`)"
             BOOT_ENV_EMMC="OpenWrt U-Boot Mod (\`fitblk\`)"
@@ -968,7 +1092,7 @@ jobs:
 
           ### 版本陣容
 
-          提供 **Standard（\`Std\`）** 與 **Pro（\`Pro\`）** 兩款企業級版本，全面移除冗餘之動態 DNS（DDNS）背景組件，保持系統純淨高效：
+          提供 **Standard（\`Std\`）** 與 **Pro（\`Pro\`）** 兩款版本配置，兼顧純淨穩定與進階網路管理需求：
 
           | 版本代號 | 版本定位 | 檔名標識 | 預載應用與服務 |
           | :--- | :--- | :--- | :--- |
@@ -1000,8 +1124,9 @@ jobs:
       - name: 發布至 GitHub Releases (Create Unified Release)
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: "ImmortalWrt ${{ env.DETECTED_VER }} (${{ env.IMG_FMT_UPPER }}) · ${{ env.RELEASE_TAG }}"
+          tag_name: ${{ steps.prep_release.outputs.release_tag || env.RELEASE_TAG || format('v{0}-Build-{1}', github.run_id, github.run_number) }}
+          target_commitish: ${{ github.sha }}
+          name: "ImmortalWrt ${{ steps.prep_release.outputs.detected_ver || env.DETECTED_VER || '25.12' }} (${{ steps.prep_release.outputs.img_fmt_upper || env.IMG_FMT_UPPER || 'BIN' }}) · ${{ steps.prep_release.outputs.release_tag || env.RELEASE_TAG }}"
           body_path: release_notes.md
           files: |
             all_firmwares/*.bin
