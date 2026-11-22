@@ -1,0 +1,1440 @@
+name: ImmortalWrt 自動追蹤最新正式版與快照版 (BIN/ITB 雙原生格式・Std/Pro 增量極速編譯)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: '選擇編譯版本 (預設 latest-release-1 為最新穩定版；自動追蹤最新 3 個穩定版與最新 1 個 SNAPSHOT 版)'
+        required: false
+        default: 'latest-release-1'
+        type: choice
+        options:
+          - latest-release-1
+          - latest-release-2
+          - latest-release-3
+          - latest-snapshot
+      image_format:
+        description: '選擇編譯原生韌體格式 (預設 bin 適配 Yuzhii U-Boot；itb 為官方主線原生 FIT 鏡像格式)'
+        required: false
+        default: 'bin'
+        type: choice
+        options:
+          - bin
+          - itb
+      target_filter:
+        description: '選擇編譯設備 (all 為單機 Multi-Profile 一次編譯全部三款機型)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - cudy_tr3000-v1
+          - jdcloud_re-cp-03
+          - cmcc_rax3000m-emmc
+      variant_filter:
+        description: '選擇韌體版本規格 (all 為增量雙階段編譯 Std + Pro；亦可單獨編譯 Std 或 Pro)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - Pro
+          - Std
+
+# 最小權限原則：頂層清空權限，僅在 release 階段授予 contents: write
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.source_branch || 'latest-release-1' }}-${{ inputs.image_format || 'bin' }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  # ===========================================================================
+  # 階段 1：輕量元資料解析 (約 10~15 秒)
+  # 統一鎖定上游 Ref、版本號、時間戳與建置目標，避免多點查詢不一致
+  # ===========================================================================
+  prepare:
+    name: 解析建置版本與參數 (Prepare Metadata)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      source_ref: ${{ steps.meta.outputs.source_ref }}
+      resolved_ver: ${{ steps.meta.outputs.resolved_ver }}
+      img_fmt: ${{ steps.meta.outputs.img_fmt }}
+      targets: ${{ steps.meta.outputs.targets }}
+      variants: ${{ steps.meta.outputs.variants }}
+      need_pro: ${{ steps.meta.outputs.need_pro }}
+      expected_count: ${{ steps.meta.outputs.expected_count }}
+      build_start_time: ${{ steps.meta.outputs.build_start_time }}
+      cache_week: ${{ steps.meta.outputs.cache_week }}
+    steps:
+      - name: 查詢 ImmortalWrt 上游版本並鎖定建置參數
+        id: meta
+        run: |
+          set -euo pipefail
+
+          retry() {
+            local max_attempts=$1; shift
+            local attempt=1
+            until "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                return 1
+              fi
+              echo "::warning::指令執行失敗 (第 ${attempt}/${max_attempts} 次)，等待重試..."
+              sleep $((attempt * 3))
+              attempt=$((attempt + 1))
+            done
+          }
+
+          BUILD_START_TIME=$(TZ=Asia/Taipei date "+%Y年%m月%d日 %H時%M分")
+          CACHE_WEEK=$(TZ=Asia/Taipei date "+%G-W%V")
+          CHOICE="${{ inputs.source_branch || 'latest-release-1' }}"
+          IMG_FMT="${{ inputs.image_format || 'bin' }}"
+          TARGET_FILTER="${{ inputs.target_filter || 'all' }}"
+          VARIANT_FILTER="${{ inputs.variant_filter || 'all' }}"
+
+          SOURCE_REF=""
+          RESOLVED_VER=""
+
+          case "$CHOICE" in
+            latest-release-1|latest-release-2|latest-release-3)
+              RANK="${CHOICE##*-}"
+              echo "正在查詢 ImmortalWrt 官方倉庫最新前 3 個正式版 Tag..."
+              # 先完整接收再由 awk 過濾，徹底避免 pipefail 下 head 提早關閉管道觸發 SIGPIPE
+              REMOTE_TAGS=$(retry 3 git ls-remote --tags --sort=-v:refname \
+                https://github.com/immortalwrt/immortalwrt.git 'refs/tags/v[0-9]*')
+              TOP3_TAGS=$(printf '%s\n' "$REMOTE_TAGS" \
+                | awk -F'refs/tags/' '!/\^\{\}$/ && $2 ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ { if (c < 3) { print $2; c++ } }')
+
+              if [ -z "$TOP3_TAGS" ]; then
+                echo "::error::無法從 ImmortalWrt 官方倉庫查詢到任何正式版 Tag！"
+                exit 1
+              fi
+
+              echo "目前官方最新三個穩定正式版依序為："
+              printf '%s\n' "$TOP3_TAGS" | nl -w2 -s'. '
+
+              SOURCE_REF=$(printf '%s\n' "$TOP3_TAGS" | sed -n "${RANK}p")
+              [ -n "$SOURCE_REF" ] || SOURCE_REF=$(printf '%s\n' "$TOP3_TAGS" | sed -n '1p')
+              RESOLVED_VER="${SOURCE_REF#v}"
+              ;;
+            latest-snapshot)
+              echo "正在查詢 ImmortalWrt 最新開發分支..."
+              REMOTE_HEADS=$(retry 3 git ls-remote --heads --sort=-v:refname \
+                https://github.com/immortalwrt/immortalwrt.git 'refs/heads/openwrt-[0-9]*')
+              SOURCE_REF=$(printf '%s\n' "$REMOTE_HEADS" \
+                | awk -F'refs/heads/' '$2 ~ /^openwrt-[0-9]+\.[0-9]+$/ { if (!found) { print $2; found=1 } }')
+              [ -n "$SOURCE_REF" ] || SOURCE_REF="openwrt-25.12"
+              RESOLVED_VER="${SOURCE_REF#openwrt-}-SNAPSHOT"
+              ;;
+            *)
+              SOURCE_REF="$CHOICE"
+              RESOLVED_VER="${CHOICE#v}"
+              ;;
+          esac
+
+          if [ "$TARGET_FILTER" = "all" ]; then
+            TARGETS="cudy_tr3000-v1 jdcloud_re-cp-03 cmcc_rax3000m-emmc"
+            TARGET_COUNT=3
+          else
+            TARGETS="$TARGET_FILTER"
+            TARGET_COUNT=1
+          fi
+
+          # 順序固定為 Std -> Pro，確保雙階段增量編譯可 100% 重用工具鏈與基礎套件
+          case "$VARIANT_FILTER" in
+            all)
+              VARIANTS="Std Pro"
+              VARIANT_COUNT=2
+              NEED_PRO="true"
+              ;;
+            Std)
+              VARIANTS="Std"
+              VARIANT_COUNT=1
+              NEED_PRO="false"
+              ;;
+            Pro)
+              VARIANTS="Pro"
+              VARIANT_COUNT=1
+              NEED_PRO="true"
+              ;;
+            *)
+              echo "::error::不支援的 variant_filter: ${VARIANT_FILTER}"
+              exit 1
+              ;;
+          esac
+
+          EXPECTED_COUNT=$((TARGET_COUNT * VARIANT_COUNT))
+
+          echo "鎖定建置參數："
+          echo "  - Source Ref     : ${SOURCE_REF} (版本號: ${RESOLVED_VER})"
+          echo "  - Image Format   : ${IMG_FMT}"
+          echo "  - Targets        : ${TARGETS}"
+          echo "  - Variants       : ${VARIANTS} (需整合 Pro: ${NEED_PRO})"
+          echo "  - Expected Files : ${EXPECTED_COUNT}"
+          echo "  - Start Time     : ${BUILD_START_TIME}"
+
+          {
+            echo "source_ref=${SOURCE_REF}"
+            echo "resolved_ver=${RESOLVED_VER}"
+            echo "img_fmt=${IMG_FMT}"
+            echo "targets=${TARGETS}"
+            echo "variants=${VARIANTS}"
+            echo "need_pro=${NEED_PRO}"
+            echo "expected_count=${EXPECTED_COUNT}"
+            echo "build_start_time=${BUILD_START_TIME}"
+            echo "cache_week=${CACHE_WEEK}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ===========================================================================
+  # 階段 2：單機 Multi-Profile + 增量 Std->Pro 統一極速編譯
+  # 共享工具鏈/核心/套件與壓縮快取，省去 80%+ Runner 資源並大幅縮短等待時間
+  # ===========================================================================
+  build:
+    name: 統一編譯 (${{ needs.prepare.outputs.resolved_ver }}・${{ needs.prepare.outputs.img_fmt }}・${{ inputs.variant_filter || 'all' }})
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      upstream_commit_time: ${{ steps.clone.outputs.upstream_commit_time }}
+      upstream_commit_hash: ${{ steps.clone.outputs.upstream_commit_hash }}
+      img_version: ${{ steps.compile.outputs.img_version }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      RESOLVED_VER: ${{ needs.prepare.outputs.resolved_ver }}
+      SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
+      IMG_FMT: ${{ needs.prepare.outputs.img_fmt }}
+      TARGETS: ${{ needs.prepare.outputs.targets }}
+      VARIANTS: ${{ needs.prepare.outputs.variants }}
+      NEED_PRO: ${{ needs.prepare.outputs.need_pro }}
+      # ccache 效能調優：壓縮儲存、跨機型/格式共用、提升命中率
+      CCACHE_DIR: ${{ github.workspace }}/openwrt/.ccache
+      CCACHE_COMPRESS: "true"
+      CCACHE_COMPRESSLEVEL: "6"
+      CCACHE_MAXSIZE: "2G"
+      CCACHE_SLOPPINESS: "file_macro,locale,time_macros"
+
+    steps:
+      - name: 極速清理磁碟與安裝均衡精簡編譯依賴 (Fast Env Init)
+        run: |
+          set -euo pipefail
+          echo "::group::併發釋放磁碟空間並更新 APT 索引"
+          printf '%s\n' \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/local/share/swift \
+            /usr/share/miniconda \
+            /usr/local/graalvm \
+            /usr/local/.ghcup \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /usr/local/lib/node_modules \
+            /opt/az \
+            | xargs -P "$(nproc)" sudo rm -rf &
+          CLEAN_PID=$!
+
+          sudo rm -rf /var/lib/man-db/auto-update
+          sudo -E apt-get -qq update
+          wait "$CLEAN_PID"
+          echo "::endgroup::"
+
+          echo "::group::安裝編譯依賴 (剔除重型冗餘包，保留完整輕量開發庫)"
+          sudo -E apt-get -qq -o Dpkg::Use-Pty=0 install -y --no-install-recommends \
+            ack autoconf automake autopoint binutils bison build-essential bzip2 \
+            ca-certificates ccache cmake cpio curl device-tree-compiler file flex \
+            g++ g++-multilib gawk gcc gcc-multilib genisoimage gettext git gperf \
+            intltool jq lib32gcc-s1 libc6-dev-i386 libdw-dev libelf-dev libfuse-dev \
+            libglib2.0-dev libgmp-dev libltdl-dev libmbedtls-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libzstd-dev ninja-build patch pkgconf python3 python3-pip \
+            python3-ply python3-pyelftools python3-setuptools re2c rsync \
+            squashfs-tools swig texinfo time u-boot-tools unzip wget xsltproc \
+            xxd xz-utils zlib1g-dev zstd
+
+          # 僅在編譯 Pro 版時安裝 UPX (配合 rstrip.sh 白名單保護，壓縮 mihomo 體積)
+          if [ "$NEED_PRO" = "true" ]; then
+            UPX_VER="4.2.4"
+            if curl -fsSL --retry 3 --retry-delay 2 \
+              "https://github.com/upx/upx/releases/download/v${UPX_VER}/upx-${UPX_VER}-amd64_linux.tar.xz" \
+              -o /tmp/upx.tar.xz; then
+              tar -Jxf /tmp/upx.tar.xz -C /tmp
+              sudo install -m 0755 "/tmp/upx-${UPX_VER}-amd64_linux/upx" /usr/local/bin/upx
+              rm -rf /tmp/upx*
+              upx --version | awk 'NR==1'
+            else
+              echo "::warning::UPX 下載失敗，Pro 版 mihomo 將保留未壓縮原檔"
+            fi
+          fi
+
+          sudo -E apt-get -qq clean
+          sudo timedatectl set-timezone "Asia/Taipei"
+          df -hT /
+          echo "::endgroup::"
+
+      - name: 拉取 ImmortalWrt 原始碼 (Clone Source)
+        id: clone
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            rm -rf openwrt
+            if git clone --depth 1 --single-branch -b "$SOURCE_REF" \
+              https://github.com/immortalwrt/immortalwrt.git openwrt; then
+              break
+            fi
+            [ "$attempt" -eq 3 ] && { echo "::error::拉取 ImmortalWrt 源碼失敗！"; exit 1; }
+            sleep $((attempt * 5))
+          done
+
+          UPSTREAM_COMMIT_UNIX=$(git -C openwrt log -1 --format="%ct" 2>/dev/null || true)
+          UPSTREAM_COMMIT_HASH=$(git -C openwrt log -1 --format="%h" 2>/dev/null || echo "latest")
+          if [ -n "$UPSTREAM_COMMIT_UNIX" ]; then
+            UPSTREAM_COMMIT_TIME=$(TZ=Asia/Taipei date -d "@${UPSTREAM_COMMIT_UNIX}" "+%Y年%m月%d日 %H時%M分")
+          else
+            UPSTREAM_COMMIT_TIME="${{ needs.prepare.outputs.build_start_time }}"
+          fi
+
+          echo "已拉取 ${SOURCE_REF} | Commit: ${UPSTREAM_COMMIT_HASH} (${UPSTREAM_COMMIT_TIME})"
+          {
+            echo "upstream_commit_time=${UPSTREAM_COMMIT_TIME}"
+            echo "upstream_commit_hash=${UPSTREAM_COMMIT_HASH}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 載入 dl 源碼包週級快取 (Restore dl Cache)
+        uses: actions/cache@v5
+        with:
+          path: openwrt/dl
+          key: dl-filogic-${{ needs.prepare.outputs.resolved_ver }}-${{ needs.prepare.outputs.cache_week }}
+          restore-keys: |
+            dl-filogic-${{ needs.prepare.outputs.resolved_ver }}-
+            dl-filogic-
+
+      - name: 載入統一 ccache 編譯快取 (Restore Unified ccache)
+        uses: actions/cache@v5
+        with:
+          path: openwrt/.ccache
+          key: ccache-filogic-${{ needs.prepare.outputs.resolved_ver }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-filogic-${{ needs.prepare.outputs.resolved_ver }}-
+            ccache-filogic-
+
+      - name: 適配三台設備硬體與原生格式構建規則 (Adapt Devices for Native BIN / ITB)
+        working-directory: ./openwrt
+        run: |
+          set -euo pipefail
+          python3 - "$IMG_FMT" << 'PYEOF'
+          import glob
+          import os
+          import re
+          import sys
+
+          img_fmt = sys.argv[1] if len(sys.argv) > 1 else "bin"
+          print(f"=== 正在配置三台設備之原生 [{img_fmt.upper()}] 韌體編譯配方 ===")
+
+          # 1. 無論 BIN 或 ITB，均確保 Cudy TR3000 v1 的 128MB SPI-NAND ubi 分區擴展為 112MB (0x7000000)
+          cudy_dts_patched = False
+          for dts_file in glob.glob("target/linux/mediatek/dts/*cudy-tr3000-v1*.dts*"):
+              with open(dts_file, "r", encoding="utf-8") as f:
+                  s = f.read()
+              new_s, n = re.subn(
+                  r'reg\s*=\s*<0x0*5c0000\s+0x0*4000000>;',
+                  'reg = <0x5c0000 0x7000000>;',
+                  s
+              )
+              if n > 0:
+                  with open(dts_file, "w", encoding="utf-8") as f:
+                      f.write(new_s)
+                  cudy_dts_patched = True
+                  print(f"[OK][cudy_tr3000-v1] 已將 {dts_file} 的 ubi 分區擴展為 112M (0x7000000)")
+              elif "0x7000000" in s:
+                  cudy_dts_patched = True
+                  print(f"[OK][cudy_tr3000-v1] {dts_file} 已為 112M 分區")
+
+          if not cudy_dts_patched:
+              print("::warning::未在 cudy-tr3000-v1 DTS 偵測到 0x4000000 分區定義，請確認上游是否已變更分區表")
+
+          if img_fmt == "itb":
+              has_cudy_ubootmod = False
+              for mk_path in glob.glob("target/linux/mediatek/image/*.mk"):
+                  with open(mk_path, "r", encoding="utf-8") as f:
+                      if re.search(r'^define\s+Device/cudy_tr3000-v1-ubootmod\b', f.read(), flags=re.M):
+                          has_cudy_ubootmod = True
+                          break
+
+              if has_cudy_ubootmod:
+                  print("[OK][ITB 模式] 偵測到官方原生 Device/cudy_tr3000-v1-ubootmod，三台設備均直接採用上游原生 FIT (.itb) 配方")
+              else:
+                  patched_any = False
+                  for mk_path in glob.glob("target/linux/mediatek/image/*.mk"):
+                      with open(mk_path, "r", encoding="utf-8") as f:
+                          raw_lines = f.read().splitlines()
+                      out_lines = []
+                      in_cudy = False
+                      patched = False
+                      for line in raw_lines:
+                          stripped = line.strip()
+                          if re.match(r'^define\s+Device/cudy_tr3000-v1\b', stripped):
+                              in_cudy = True
+                              out_lines.append(line)
+                              continue
+                          if in_cudy:
+                              if stripped == "endef":
+                                  out_lines.extend([
+                                      "  KERNEL := kernel-bin | gzip",
+                                      "  KERNEL_INITRAMFS := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k",
+                                      "  KERNEL_INITRAMFS_SUFFIX := -recovery.itb",
+                                      "  IMAGES := sysupgrade.itb",
+                                      "  IMAGE_SIZE := 114688k",
+                                      "  IMAGE/sysupgrade.itb := append-kernel | fit gzip $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb external-static-with-rootfs | pad-rootfs | append-metadata",
+                                      line,
+                                  ])
+                                  in_cudy = False
+                                  patched = True
+                                  continue
+                              if any(stripped.startswith(k) for k in ("IMAGES", "IMAGE/", "IMAGE_SIZE", "KERNEL")):
+                                  continue
+                          out_lines.append(line)
+                      if patched:
+                          with open(mk_path, "w", encoding="utf-8") as f:
+                              f.write("\n".join(out_lines) + "\n")
+                          patched_any = True
+                          print(f"[OK][ITB 模式] 已於 {mk_path} 為 cudy_tr3000-v1 啟用原生 FIT (.itb) 編譯規則")
+                  if not patched_any:
+                      print("::error::[ITB 模式] 無法找到 cudy_tr3000-v1 設備定義！", file=sys.stderr)
+                      sys.exit(1)
+              sys.exit(0)
+
+          # =========================================================================
+          # 【原生 BIN 模式】：全面適配 Yuzhii0718 bl-mt798x-dhcpd U-Boot
+          # =========================================================================
+          def extract_dtso_to_dts(dtso_text: str) -> str:
+              dtso_text = re.sub(r'^\s*rootdisk\s*=\s*<&[^>]+>;\s*\n?', '', dtso_text, flags=re.M)
+              if "fragment@" not in dtso_text:
+                  cleaned = re.sub(r'^\s*/(dts-v1|plugin)/;\s*\n?', '', dtso_text, flags=re.M)
+                  cleaned = re.sub(r'/\s*\{\s*compatible\s*=\s*[^;]+;\s*\};\s*', '', cleaned, flags=re.S)
+                  return "\n" + cleaned.strip() + "\n"
+              out = []
+              pos = 0
+              while True:
+                  m = re.search(r'fragment@\d+\s*\{', dtso_text[pos:])
+                  if not m:
+                      break
+                  start = pos + m.end()
+                  depth = 1
+                  i = start
+                  while i < len(dtso_text) and depth > 0:
+                      if dtso_text[i] == '{':
+                          depth += 1
+                      elif dtso_text[i] == '}':
+                          depth -= 1
+                      i += 1
+                  frag_body = dtso_text[start:i - 1]
+                  pos = i
+                  t_m = re.search(r'target\s*=\s*<(&[a-zA-Z0-9_]+)>;', frag_body)
+                  tp_m = re.search(r'target-path\s*=\s*"([^"]+)";', frag_body)
+                  o_m = re.search(r'__overlay__\s*\{', frag_body)
+                  if o_m:
+                      o_start = o_m.end()
+                      o_depth = 1
+                      j = o_start
+                      while j < len(frag_body) and o_depth > 0:
+                          if frag_body[j] == '{':
+                              o_depth += 1
+                          elif frag_body[j] == '}':
+                              o_depth -= 1
+                          j += 1
+                      overlay_body = frag_body[o_start:j - 1]
+                      if not overlay_body.strip():
+                          continue
+                      if t_m and t_m.group(1) != "&chosen":
+                          out.append(f"\n{t_m.group(1)} {{{overlay_body}}};\n")
+                      elif (t_m and t_m.group(1) == "&chosen") or (tp_m and tp_m.group(1) == "/chosen"):
+                          out.append(f"\n/ {{\n\tchosen {{{overlay_body}}};\n}};\n")
+                      elif tp_m and tp_m.group(1) == "/":
+                          out.append(f"\n/ {{{overlay_body}}};\n")
+              return "".join(out)
+
+          rax_dts = "target/linux/mediatek/dts/mt7981b-cmcc-rax3000m.dts"
+          rax_dtso = "target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-emmc.dtso"
+          if os.path.exists(rax_dts) and os.path.exists(rax_dtso):
+              with open(rax_dts, "r", encoding="utf-8") as f:
+                  dts_content = f.read()
+              with open(rax_dtso, "r", encoding="utf-8") as f:
+                  dtso_content = f.read()
+              if "&mmc0" not in dts_content and ("fragment@" in dtso_content or "&mmc0" in dtso_content):
+                  merged_nodes = extract_dtso_to_dts(dtso_content)
+                  dts_content = (
+                      dts_content
+                      + "\n/* Merged from mt7981b-cmcc-rax3000m-emmc.dtso for Yuzhii bl-mt798x-dhcpd */\n"
+                      + merged_nodes
+                  )
+                  with open(rax_dts, "w", encoding="utf-8") as f:
+                      f.write(dts_content)
+                  print(f"[OK][cmcc_rax3000m-emmc] 已將 {rax_dtso} 的 &mmc0 節點合併至 {rax_dts}")
+
+          bootargs_line = 'bootargs = "console=ttyS0,115200n1 loglevel=8 earlycon=uart8250,mmio32,0x11002000 root=PARTLABEL=rootfs rootwait";'
+          for emmc_dts in [rax_dts, "target/linux/mediatek/dts/mt7986a-jdcloud-re-cp-03.dts"]:
+              if os.path.exists(emmc_dts):
+                  with open(emmc_dts, "r", encoding="utf-8") as f:
+                      s = f.read()
+                  s = s.replace('block-partition-production', 'block-partition-rootfs')
+                  s = s.replace('partname = "production"', 'partname = "rootfs"')
+                  s = re.sub(r'^\s*rootdisk\s*=\s*<&[^>]+>;\s*\n?', '', s, flags=re.M)
+                  s = re.sub(r'^\s*bootargs(-override|-append)?\s*=\s*"[^"]*";\s*\n?', '', s, flags=re.M)
+                  s, n = re.subn(r'(chosen\s*\{)', rf'\1\n\t\t{bootargs_line}', s, count=1)
+                  if n == 0:
+                      s += f"\n/ {{\n\tchosen {{\n\t\t{bootargs_line}\n\t}};\n}};\n"
+                  with open(emmc_dts, "w", encoding="utf-8") as f:
+                      f.write(s)
+                  print(f"[OK][eMMC DTS] 已修正 {emmc_dts} 掛載分區為 root=PARTLABEL=rootfs")
+
+          SKIP_KEYS = (
+              "DEVICE_DTS_OVERLAY", "DEVICE_DTS_LOADADDR", "KERNEL",
+              "KERNEL_INITRAMFS", "KERNEL_INITRAMFS_SUFFIX", "IMAGES",
+              "IMAGE_SIZE", "IMAGE/sysupgrade.itb", "IMAGE/sysupgrade.bin",
+              "ARTIFACTS", "ARTIFACT/", "COMPAT_VERSION", "COMPAT_MESSAGE",
+              "UBOOTENV_IN_UBI", "KERNEL_IN_UBI",
+          )
+
+          total_patched = []
+          for mk_path in glob.glob("target/linux/mediatek/image/*.mk"):
+              with open(mk_path, "r", encoding="utf-8") as f:
+                  raw_lines = f.read().splitlines()
+
+              out_lines = []
+              in_mode = None
+              dev_name = ""
+              skip_cont = False
+              patched_in_file = []
+
+              for line in raw_lines:
+                  stripped = line.strip()
+                  m_def = re.match(r'^define\s+Device/([a-zA-Z0-9_-]+)', stripped)
+                  if m_def and in_mode is None:
+                      dname = m_def.group(1)
+                      if dname == "cudy_tr3000-v1":
+                          in_mode = "cudy"
+                          dev_name = dname
+                          out_lines.append(line)
+                          continue
+                      elif dname.startswith("cmcc_rax3000m") or dname.startswith("jdcloud_re-cp-03"):
+                          in_mode = "emmc"
+                          dev_name = dname
+                          skip_cont = False
+                          out_lines.append(line)
+                          continue
+
+                  if in_mode == "cudy":
+                      if stripped == "endef":
+                          in_mode = None
+                          patched_in_file.append(dev_name)
+                          out_lines.append(line)
+                          continue
+                      line = re.sub(r'IMAGE_SIZE\s*[:+]?=\s*65536k', 'IMAGE_SIZE := 114688k', line)
+                      line = line.replace("sysupgrade-tar", "append-ubi | check-size")
+                      out_lines.append(line)
+                      continue
+
+                  if in_mode == "emmc":
+                      if stripped == "endef":
+                          out_lines.extend([
+                              "  DEVICE_DTS_OVERLAY :=",
+                              "  KERNEL_IN_UBI :=",
+                              "  UBOOTENV_IN_UBI :=",
+                              "  ARTIFACTS :=",
+                              "  KERNEL := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb",
+                              "  KERNEL_INITRAMFS := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k",
+                              "  KERNEL_INITRAMFS_SUFFIX := -kernel.bin",
+                              "  IMAGES := sysupgrade.bin",
+                              "  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata",
+                              line,
+                          ])
+                          in_mode = None
+                          skip_cont = False
+                          patched_in_file.append(dev_name)
+                          continue
+
+                      if skip_cont:
+                          if not stripped.endswith("\\"):
+                              skip_cont = False
+                          continue
+
+                      tokens = stripped.split()
+                      first_tok = tokens[0] if tokens else ""
+                      if any(first_tok == k or first_tok.startswith("ARTIFACT/") for k in SKIP_KEYS):
+                          if stripped.endswith("\\"):
+                              skip_cont = True
+                          continue
+
+                      out_lines.append(line)
+                      continue
+
+                  out_lines.append(line)
+
+              if patched_in_file:
+                  with open(mk_path, "w", encoding="utf-8") as f:
+                      f.write("\n".join(out_lines) + "\n")
+                  total_patched.extend(patched_in_file)
+                  print(f"[OK][BIN 模式] 已於 {mk_path} 覆寫設備區塊: {patched_in_file}")
+
+          # Fail-Fast 斷言：確保三款機型皆成功適配
+          for req in ("cudy_tr3000-v1", "jdcloud_re-cp-03", "cmcc_rax3000m"):
+              if not any(p.startswith(req) for p in total_patched):
+                  print(f"::error::[BIN 模式] 未能在 *.mk 中找到並適配設備: {req}！已匹配: {total_patched}", file=sys.stderr)
+                  sys.exit(1)
+
+          plat_sh = "target/linux/mediatek/filogic/base-files/lib/upgrade/platform.sh"
+          if os.path.exists(plat_sh):
+              with open(plat_sh, "r", encoding="utf-8") as f:
+                  ps = f.read()
+              ps = re.sub(r'^\s*(cmcc,rax3000m|jdcloud,re-cp-03)\|\\\n', '', ps, flags=re.M)
+              ps = ps.replace('CI_KERNPART="production"', 'CI_KERNPART="kernel"\n\t\tCI_ROOTPART="rootfs"')
+
+              # 主錨點 + 備用錨點，兼顧抗重構韌性與 Fail-Fast 安全斷言
+              ps, n1 = re.subn(
+                  r'(acer,predator-w6\|\\\n)',
+                  r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03|\\\n\1',
+                  ps,
+                  count=1
+              )
+              if n1 == 0:
+                  ps, n1 = re.subn(
+                      r'(\t[^\n]+\)\n\t\tCI_KERNPART="kernel")',
+                      r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03|\\\n\1',
+                      ps,
+                      count=1
+                  )
+
+              ps, n2 = re.subn(
+                  r'(\t[^\n]+\|\\\n\t[^\n]+\)\n\t\temmc_copy_config)',
+                  r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03|\\\n\1',
+                  ps,
+                  count=1
+              )
+              if n2 == 0:
+                  ps, n2 = re.subn(
+                      r'(\t[^\n]+\)\n\t\temmc_copy_config)',
+                      r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03|\\\n\1',
+                      ps,
+                      count=1
+                  )
+
+              if 'nand_do_platform_check' in ps:
+                  ps = re.sub(
+                      r'(\*\)\n\t\tnand_do_platform_check)',
+                      r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03)\n\t\treturn 0\n\t\t;;\n\t\1',
+                      ps,
+                      count=1
+                  )
+
+              if n1 == 0 or n2 == 0:
+                  print(f"::error::platform.sh 結構已變更 (n1={n1}, n2={n2})，中止編譯以防升級邏輯異常！", file=sys.stderr)
+                  sys.exit(1)
+              with open(plat_sh, "w", encoding="utf-8") as f:
+                  f.write(ps)
+              print("[OK][BIN 模式] platform.sh eMMC kernel/rootfs 升級邏輯修正完成")
+
+          for bf in [
+              "target/linux/mediatek/filogic/base-files/etc/board.d/02_network",
+              "target/linux/mediatek/filogic/base-files/etc/hotplug.d/firmware/11-mt76-caldata",
+              "target/linux/mediatek/filogic/base-files/etc/hotplug.d/ieee80211/11_fix_wifi_mac",
+              "package/boot/uboot-envtools/files/mediatek_filogic",
+              plat_sh,
+          ]:
+              if os.path.exists(bf):
+                  with open(bf, "r", encoding="utf-8") as f:
+                      c = f.read()
+                  if "/dev/mmc*)" in c:
+                      c = c.replace("/dev/mmc*)", '/dev/mmc*|PARTLABEL=*|"")')
+                      with open(bf, "w", encoding="utf-8") as f:
+                          f.write(c)
+                      print(f"[OK][base-files] 已擴展 {bf} 支援 root=PARTLABEL=rootfs")
+          PYEOF
+
+          echo "::group::審計修改後的 filogic.mk 設備定義"
+          sed -n '/^define Device\/cmcc_rax3000m/,/^endef/p' target/linux/mediatek/image/*.mk
+          sed -n '/^define Device\/jdcloud_re-cp-03/,/^endef/p' target/linux/mediatek/image/*.mk
+          sed -n '/^define Device\/cudy_tr3000-v1/,/^endef/p' target/linux/mediatek/image/*.mk
+          echo "::endgroup::"
+
+      - name: 更新軟體源與整合外部插件 (Update Feeds & Extra Plugins)
+        working-directory: ./openwrt
+        run: |
+          set -euo pipefail
+
+          retry() {
+            local max_attempts=$1; shift
+            local attempt=1
+            until "$@"; do
+              [ "$attempt" -ge "$max_attempts" ] && return 1
+              echo "::warning::指令失敗 (第 ${attempt}/${max_attempts} 次)，重試中..."
+              sleep $((attempt * 4))
+              attempt=$((attempt + 1))
+            done
+          }
+
+          echo "::group::更新並安裝 Feeds"
+          if [ "$NEED_PRO" = "true" ]; then
+            echo "src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main" >> feeds.conf.default
+          fi
+
+          retry 3 ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          if [ "$NEED_PRO" = "true" ]; then
+            ./scripts/feeds install -a -f -p nikki
+
+            # 移除 nikki 對原版 mihomo 二進位的強制依賴 (相容空白、續行符 \ 與行尾)
+            for mk in feeds/nikki/nikki/Makefile package/feeds/nikki/nikki/Makefile; do
+              if [ -f "$mk" ]; then
+                sed -i -E 's/\+mihomo(-meta|-alpha)?([[:space:]]|\\|$)/\2/g' "$mk"
+              fi
+            done
+
+            # 保護自訂 mihomo 核心不被 OpenWrt rstrip.sh 剝離符號破壞並驗證生效
+            if [ -f scripts/rstrip.sh ]; then
+              sed -i -E 's/(find "?\$TARGETS"? -type f)/\1 ! -name "mihomo*"/g' scripts/rstrip.sh
+              if ! grep -q 'mihomo\*' scripts/rstrip.sh; then
+                echo "::error::scripts/rstrip.sh 白名單規則套用失敗！"
+                exit 1
+              fi
+            fi
+
+            # 清理舊版 rtp2httpd 並引入官方最新原生 C 版
+            rm -rf \
+              feeds/packages/net/rtp2httpd \
+              feeds/luci/applications/luci-app-rtp2httpd \
+              package/feeds/packages/rtp2httpd \
+              package/feeds/luci/luci-app-rtp2httpd \
+              package/rtp2httpd \
+              package/luci-app-rtp2httpd
+
+            rm -rf /tmp/rtp2httpd
+            retry 3 git clone --depth 1 --single-branch https://github.com/stackia/rtp2httpd.git /tmp/rtp2httpd
+            cp -rf /tmp/rtp2httpd/openwrt-support/rtp2httpd package/rtp2httpd
+            cp -rf /tmp/rtp2httpd/openwrt-support/luci-app-rtp2httpd package/luci-app-rtp2httpd
+            [ -f package/rtp2httpd/Makefile.versioned ] && mv -f package/rtp2httpd/Makefile.versioned package/rtp2httpd/Makefile
+            [ -f package/luci-app-rtp2httpd/Makefile.versioned ] && mv -f package/luci-app-rtp2httpd/Makefile.versioned package/luci-app-rtp2httpd/Makefile
+            rm -rf /tmp/rtp2httpd
+          fi
+
+          # 強制將 LuCI 集合預設主題由 bootstrap 改為 Argon
+          find feeds/luci/collections/ -name "Makefile" -exec sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' {} + || true
+          echo "::endgroup::"
+
+      - name: 配置品牌標識、LAN IP、TCP BBR 與核心對齊的官方 kmods (Configure Branding & Vermagic)
+        working-directory: ./openwrt
+        run: |
+          set -euo pipefail
+          TARGET_VER="${RESOLVED_VER}"
+
+          # 1. 統一預設 LAN IP 為 192.168.7.1，主機名改為 ImmortalWrt
+          for cfg in \
+            package/base-files/files/bin/config_generate \
+            package/base-files/luci2/bin/config_generate \
+            package/base-files/files/lib/preinit/00_preinit.conf; do
+            if [ -f "$cfg" ]; then
+              sed -i 's/192\.168\.1\.1/192.168.7.1/g' "$cfg"
+              sed -i "s/hostname='OpenWrt'/hostname='ImmortalWrt'/g; s/hostname=\"OpenWrt\"/hostname=\"ImmortalWrt\"/g" "$cfg"
+            fi
+          done
+
+          # 2. 動態修正 version.mk 與 image-config.in (相容未來所有 25.xx / 26.xx 版本)
+          if [ -f include/version.mk ]; then
+            sed -i -E \
+              -e 's/VERSION_DIST:=OpenWrt/VERSION_DIST:=ImmortalWrt/g' \
+              -e 's/VERSION_DIST\),OpenWrt/VERSION_DIST),ImmortalWrt/g' \
+              -e "s/VERSION_NUMBER:=[0-9]+\.[0-9]+-SNAPSHOT/VERSION_NUMBER:=${TARGET_VER}/g" \
+              -e "s/VERSION_NUMBER\),[0-9]+\.[0-9]+-SNAPSHOT/VERSION_NUMBER),${TARGET_VER}/g" \
+              include/version.mk
+          fi
+          for icfg in package/base-files/image-config.in Config.in; do
+            if [ -f "$icfg" ]; then
+              sed -i -E \
+                -e 's/default "OpenWrt"/default "ImmortalWrt"/g' \
+                -e "s/default \"[0-9]+\.[0-9]+-SNAPSHOT\"/default \"${TARGET_VER}\"/g" \
+                "$icfg"
+            fi
+          done
+
+          # 3. 偵測源碼樹核心版本，嚴格匹配同核心版本的官方 kmods 與 32 位元 vermagic
+          KMAJOR=$(awk -F':=' '/^KERNEL_PATCHVER/{gsub(/[[:space:]]/,"",$2); print $2; exit}' target/linux/mediatek/Makefile 2>/dev/null || true)
+          KMINOR=""
+          if [ -n "$KMAJOR" ] && [ -f "include/kernel-${KMAJOR}" ]; then
+            KMINOR=$(awk -F'=' -v km="$KMAJOR" '$1 ~ "LINUX_VERSION-"km {gsub(/[[:space:]]/,"",$2); print $2; exit}' "include/kernel-${KMAJOR}" 2>/dev/null || true)
+          fi
+          FULL_KVER="${KMAJOR}${KMINOR}"
+          echo "偵測到源碼樹核心版本: ${FULL_KVER:-未知} (主系列: ${KMAJOR:-未知})"
+
+          OFFICIAL_KMOD_DIR=""
+          OFFICIAL_VERMAGIC=""
+          KMOD_CANDIDATE_URLS=("https://downloads.immortalwrt.org/releases/${TARGET_VER}/targets/mediatek/filogic/kmods/")
+          if [[ "$TARGET_VER" == *SNAPSHOT* ]]; then
+            KMOD_CANDIDATE_URLS+=("https://downloads.immortalwrt.org/snapshots/targets/mediatek/filogic/kmods/")
+          fi
+
+          for base_url in "${KMOD_CANDIDATE_URLS[@]}"; do
+            KMOD_HTML=$(curl -fsSL --retry 2 --connect-timeout 8 "$base_url" 2>/dev/null || true)
+            [ -n "$KMOD_HTML" ] || continue
+
+            CAND_DIR=""
+            if [ -n "$FULL_KVER" ]; then
+              CAND_DIR=$(printf '%s\n' "$KMOD_HTML" | grep -oE "${FULL_KVER//./\\.}-[0-9]+-[0-9a-f]{32}" | tail -n 1 || true)
+            fi
+            if [ -z "$CAND_DIR" ] && [ -n "$KMAJOR" ]; then
+              CAND_DIR=$(printf '%s\n' "$KMOD_HTML" | grep -oE "${KMAJOR//./\\.}\.[0-9]+-[0-9]+-[0-9a-f]{32}" | tail -n 1 || true)
+            fi
+            if [ -z "$CAND_DIR" ] && [[ "$base_url" == *"/releases/${TARGET_VER}/"* ]]; then
+              CAND_DIR=$(printf '%s\n' "$KMOD_HTML" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[0-9a-f]{32}' | tail -n 1 || true)
+            fi
+
+            if [ -n "$CAND_DIR" ]; then
+              CAND_MAGIC="${CAND_DIR##*-}"
+              if [ "${#CAND_MAGIC}" -eq 32 ]; then
+                OFFICIAL_KMOD_DIR="$CAND_DIR"
+                OFFICIAL_VERMAGIC="$CAND_MAGIC"
+                echo "[OK] 匹配官方 kmods 目錄: ${OFFICIAL_KMOD_DIR} (vermagic: ${OFFICIAL_VERMAGIC})"
+                break
+              fi
+            fi
+          done
+
+          if [ "${#OFFICIAL_VERMAGIC}" -eq 32 ] && [ -f include/kernel-defaults.mk ]; then
+            # 使用 Python 精準改寫並保留 Makefile Tab 縮排，杜絕 sed 跳脫錯誤與管線 SIGPIPE
+            python3 - "$OFFICIAL_VERMAGIC" << 'PYEOF'
+          import re
+          import sys
+
+          magic = sys.argv[1]
+          path = "include/kernel-defaults.mk"
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          new_content, n = re.subn(
+              r'^(\t).*?\$\(MKHASH\)\s+md5\s*>\s*\$\(LINUX_DIR\)/\.vermagic\b.*$',
+              rf"\1echo '{magic}' > $(LINUX_DIR)/.vermagic",
+              content,
+              flags=re.M
+          )
+          if n > 0:
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(new_content)
+              print(f"[OK] 已將 {path} 核心 vermagic 鎖定為官方值: {magic} (更新 {n} 處)")
+          else:
+              print("::warning::未在 kernel-defaults.mk 匹配到 .vermagic 規則，保留編譯自動計算值")
+          PYEOF
+          else
+            echo "::warning::未找到核心相符之官方 kmods 目錄，將使用編譯自動生成的 vermagic"
+          fi
+
+          # 4. 預設啟用 TCP BBR
+          mkdir -p files/etc/sysctl.d files/etc/uci-defaults
+          cat > files/etc/sysctl.d/99-turboacc-bbr.conf << 'EOF'
+          net.ipv4.tcp_congestion_control=bbr
+          EOF
+
+          # 5. 建立 99-z-change-lan-ip (安全變數標頭 + 單引號 Heredoc，完整相容 apk/opkg 與 release/snapshot)
+          {
+            echo '#!/bin/sh'
+            printf "TARGET_VER='%s'\n" "${TARGET_VER}"
+            printf "OFFICIAL_KMOD_DIR='%s'\n" "${OFFICIAL_KMOD_DIR}"
+            printf "OFFICIAL_VERMAGIC='%s'\n" "${OFFICIAL_VERMAGIC}"
+            cat << 'UCIEOF'
+          uci set network.lan.ipaddr='192.168.7.1'
+          uci set network.lan.netmask='255.255.255.0'
+          uci commit network
+
+          uci set system.@system[0].hostname='ImmortalWrt'
+          uci commit system
+          echo "ImmortalWrt" > /proc/sys/kernel/hostname
+
+          for rel in /etc/openwrt_release /etc/os-release /usr/lib/os-release; do
+            if [ -f "$rel" ]; then
+              sed -i -E "s/OpenWrt/ImmortalWrt/g; s/[0-9]+\.[0-9]+-SNAPSHOT/${TARGET_VER}/g" "$rel"
+            fi
+          done
+
+          for f in /etc/apk/repositories.d/distfeeds.list /etc/opkg/distfeeds.conf; do
+            if [ -f "$f" ]; then
+              sed -i '/\/nikki\//d; /\/video\//d' "$f"
+              sed -i -E "s/[0-9]+\.[0-9]+-SNAPSHOT/${TARGET_VER}/g" "$f"
+            fi
+          done
+
+          if [ -n "$OFFICIAL_KMOD_DIR" ] && [ -f /etc/apk/repositories.d/distfeeds.list ]; then
+            if ! grep -q "/kmods/" /etc/apk/repositories.d/distfeeds.list; then
+              MIRROR_PREFIX=$(grep -oE '^https?://[^/]+(/[^/]+)?/(releases/[^/]+|snapshots)' /etc/apk/repositories.d/distfeeds.list | head -n 1 || true)
+              if [ -z "$MIRROR_PREFIX" ]; then
+                case "$TARGET_VER" in
+                  *SNAPSHOT*) MIRROR_PREFIX="https://downloads.immortalwrt.org/snapshots" ;;
+                  *)          MIRROR_PREFIX="https://downloads.immortalwrt.org/releases/${TARGET_VER}" ;;
+                esac
+              fi
+              echo "${MIRROR_PREFIX}/targets/mediatek/filogic/kmods/${OFFICIAL_KMOD_DIR}/packages.adb" >> /etc/apk/repositories.d/distfeeds.list
+            fi
+            KVER=$(uname -r)
+            if [ "${#OFFICIAL_VERMAGIC}" -eq 32 ]; then
+              for apk_db in /etc/apk/world /lib/apk/db/installed; do
+                if [ -f "$apk_db" ]; then
+                  sed -i -E "s/(${KVER}~)[0-9a-f]{32}/\1${OFFICIAL_VERMAGIC}/g" "$apk_db"
+                fi
+              done
+            fi
+          fi
+          exit 0
+          UCIEOF
+          } > files/etc/uci-defaults/99-z-change-lan-ip
+          chmod 0755 files/etc/uci-defaults/99-z-change-lan-ip
+
+      - name: 預下載並驗證 Pro 版 Alpha-Smart 核心 (Stage Smart Core)
+        if: ${{ needs.prepare.outputs.need_pro == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "正在下載並校驗 vernesong/mihomo 最新 Alpha-Smart 核心 (暫存於 /tmp，待 Pro 階段再部署)..."
+          rm -f /tmp/mihomo-smart*
+
+          SMART_URL=""
+          # 1. 首選：遵循 OpenWrt-nikki 官方規範讀取 version.txt
+          SMART_VER=$(curl -fsSL --retry 3 --connect-timeout 10 \
+            https://github.com/vernesong/mihomo/releases/download/Prerelease-Alpha/version.txt 2>/dev/null | tr -d '[:space:]' || true)
+          if [ -n "$SMART_VER" ]; then
+            CANDIDATE_URL="https://github.com/vernesong/mihomo/releases/download/Prerelease-Alpha/mihomo-linux-arm64-${SMART_VER}.gz"
+            if curl -fsSLI --retry 2 --connect-timeout 10 "$CANDIDATE_URL" >/dev/null 2>&1; then
+              SMART_URL="$CANDIDATE_URL"
+              echo "[OK] 透過 version.txt 精準解析: ${SMART_VER}"
+            fi
+          fi
+
+          # 2. 次選：GitHub API 查詢 Prerelease-Alpha 最新 arm64 核心
+          if [ -z "$SMART_URL" ]; then
+            RELEASE_JSON=$(curl -fsSL --retry 3 --connect-timeout 10 \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/vernesong/mihomo/releases/tags/Prerelease-Alpha 2>/dev/null || true)
+            SMART_URL=$(printf '%s\n' "$RELEASE_JSON" \
+              | jq -r '.assets[]? | select(.name | test("^mihomo-linux-arm64-(go[0-9]+-)?alpha(-smart)?-[a-zA-Z0-9._-]+\\.gz$")) | .browser_download_url' \
+              | awk 'NR==1' || true)
+          fi
+
+          # 3. 三重備援：解析 Release 展開頁面
+          if [ -z "$SMART_URL" ] || [ "$SMART_URL" = "null" ]; then
+            EXPANDED_HTML=$(curl -fsSL --retry 3 --connect-timeout 10 \
+              https://github.com/vernesong/mihomo/releases/expanded_assets/Prerelease-Alpha 2>/dev/null || true)
+            REL_PATH=$(printf '%s\n' "$EXPANDED_HTML" \
+              | grep -oE '/vernesong/mihomo/releases/download/Prerelease-Alpha/mihomo-linux-arm64-(go[0-9]+-)?alpha(-smart)?-[a-zA-Z0-9._-]+\.gz' \
+              | awk 'NR==1' || true)
+            [ -n "$REL_PATH" ] && SMART_URL="https://github.com${REL_PATH}"
+          fi
+
+          if [ -z "$SMART_URL" ] || [ "$SMART_URL" = "null" ]; then
+            echo "::error::無法取得 vernesong/mihomo (Prerelease-Alpha) arm64 Smart 核心下載位址！"
+            exit 1
+          fi
+
+          echo "下載位址: ${SMART_URL}"
+          curl -fsSL --retry 3 --retry-delay 3 -o /tmp/mihomo-smart.gz "$SMART_URL"
+          gzip -d -f /tmp/mihomo-smart.gz
+
+          # 嚴格驗證 ELF arm64 架構完整性
+          if [ ! -s /tmp/mihomo-smart ] || ! file /tmp/mihomo-smart | grep -qiE "ELF.*(aarch64|arm64)"; then
+            echo "::error::下載的 mihomo 核心檔案損毀或非有效 arm64 ELF！"
+            file /tmp/mihomo-smart || true
+            exit 1
+          fi
+          chmod 0755 /tmp/mihomo-smart
+
+          # 安全 UPX 壓縮並執行完整性自檢 (upx -t)
+          if command -v upx >/dev/null 2>&1; then
+            echo "執行 UPX 壓縮與完整性校驗..."
+            cp -f /tmp/mihomo-smart /tmp/mihomo-smart.upx
+            if upx -9 /tmp/mihomo-smart.upx && upx -t /tmp/mihomo-smart.upx; then
+              mv -f /tmp/mihomo-smart.upx /tmp/mihomo-smart
+              echo "[OK] UPX 壓縮與自檢通過"
+            else
+              rm -f /tmp/mihomo-smart.upx
+              echo "::warning::UPX 壓縮或自檢未通過，保留原始二進位檔"
+            fi
+          fi
+          ls -lh /tmp/mihomo-smart
+
+      - name: 多機型 Multi-Profile 與增量雙階段編譯、校驗並歸檔 (Compile & Verify All)
+        id: compile
+        working-directory: ./openwrt
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/collected_firmware" "$CCACHE_DIR"
+          read -r -a TARGET_ARR <<< "$TARGETS"
+          read -r -a VARIANT_ARR <<< "$VARIANTS"
+
+          declare -A PROFILE_MAP
+          for dev in "${TARGET_ARR[@]}"; do
+            case "$dev" in
+              jdcloud_re-cp-03)
+                PROFILE_MAP["$dev"]="jdcloud_re-cp-03"
+                ;;
+              cudy_tr3000-v1)
+                if [ "$IMG_FMT" = "itb" ] && grep -qE '^define Device/cudy_tr3000-v1-ubootmod([[:space:]]|$)' target/linux/mediatek/image/*.mk 2>/dev/null; then
+                  PROFILE_MAP["$dev"]="cudy_tr3000-v1-ubootmod"
+                else
+                  PROFILE_MAP["$dev"]="cudy_tr3000-v1"
+                fi
+                ;;
+              cmcc_rax3000m-emmc)
+                if grep -qE '^define Device/cmcc_rax3000m-emmc([[:space:]]|$)' target/linux/mediatek/image/*.mk 2>/dev/null; then
+                  PROFILE_MAP["$dev"]="cmcc_rax3000m-emmc"
+                else
+                  PROFILE_MAP["$dev"]="cmcc_rax3000m"
+                fi
+                ;;
+              *)
+                echo "::error::未識別的目標設備: ${dev}"
+                exit 1
+                ;;
+            esac
+            echo "機型映射: ${dev} -> Profile [${PROFILE_MAP[$dev]}]"
+          done
+
+          write_base_config() {
+            rm -rf tmp .config
+            cat > .config << 'CFG_EOF'
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_filogic=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          # CONFIG_TARGET_ROOTFS_EXT4FS is not set
+          # CONFIG_TARGET_ROOTFS_TARGZ is not set
+          CONFIG_TARGET_PREINIT_IP="192.168.7.1"
+          # CONFIG_FEED_nikki is not set
+          # CONFIG_FEED_video is not set
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+          CONFIG_PACKAGE_default-settings-chn=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_PACKAGE_kmod-mtd-rw=y
+          CONFIG_PACKAGE_ubi-utils=y
+          CONFIG_PACKAGE_e2fsprogs=y
+          CONFIG_PACKAGE_f2fsck=y
+          CONFIG_PACKAGE_mkf2fs=y
+          CONFIG_PACKAGE_fdisk=y
+          CONFIG_PACKAGE_partx-utils=y
+          CONFIG_PACKAGE_losetup=y
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_PACKAGE_uhttpd=y
+          CONFIG_PACKAGE_uhttpd-mod-ubus=y
+          CONFIG_PACKAGE_luci-compat=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+          CONFIG_PACKAGE_openssh-sftp-server=y
+          CONFIG_PACKAGE_openssh-sftp-avahi-service=y
+          CONFIG_PACKAGE_avahi-dbus-daemon=y
+          CONFIG_PACKAGE_kmod-tcp-bbr=y
+          CONFIG_PACKAGE_kmod-netlink-diag=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_kmod-nft-socket=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-mii=y
+          CONFIG_PACKAGE_kmod-usb-wdm=y
+          CONFIG_PACKAGE_kmod-usb-acm=y
+          CONFIG_PACKAGE_kmod-usb-net=y
+          CONFIG_PACKAGE_kmod-usb-net-rndis=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-ether=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-ncm=y
+          CONFIG_PACKAGE_kmod-usb-net-huawei-cdc-ncm=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-mbim=y
+          CONFIG_PACKAGE_kmod-usb-net-qmi-wwan=y
+          CONFIG_PACKAGE_kmod-usb-serial=y
+          CONFIG_PACKAGE_kmod-usb-serial-wwan=y
+          CONFIG_PACKAGE_kmod-usb-serial-option=y
+          CONFIG_PACKAGE_kmod-usb-serial-qualcomm=y
+          CONFIG_PACKAGE_usb-modeswitch=y
+          CONFIG_PACKAGE_uqmi=y
+          CONFIG_PACKAGE_umbim=y
+          CONFIG_PACKAGE_comgt-ncm=y
+          CONFIG_PACKAGE_picocom=y
+          CONFIG_PACKAGE_luci-proto-3g=y
+          CONFIG_PACKAGE_luci-proto-qmi=y
+          CONFIG_PACKAGE_luci-proto-mbim=y
+          CONFIG_PACKAGE_luci-proto-ncm=y
+          # CONFIG_PACKAGE_luci-theme-bootstrap is not set
+          CONFIG_PACKAGE_luci-theme-argon=y
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
+          CFG_EOF
+
+            if [ "${#TARGET_ARR[@]}" -gt 1 ]; then
+              {
+                echo "CONFIG_TARGET_MULTI_PROFILE=y"
+                echo "CONFIG_TARGET_PER_DEVICE_ROOTFS=y"
+                for dev in "${TARGET_ARR[@]}"; do
+                  local prof="${PROFILE_MAP[$dev]}"
+                  echo "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${prof}=y"
+                  echo "CONFIG_TARGET_DEVICE_PACKAGES_mediatek_filogic_DEVICE_${prof}=\"\""
+                done
+              } >> .config
+            else
+              local prof="${PROFILE_MAP[${TARGET_ARR[0]}]}"
+              echo "CONFIG_TARGET_mediatek_filogic_DEVICE_${prof}=y" >> .config
+            fi
+          }
+
+          append_pro_config() {
+            cat >> .config << 'PRO_EOF'
+          CONFIG_PACKAGE_nikki=y
+          CONFIG_PACKAGE_luci-app-nikki=y
+          CONFIG_PACKAGE_luci-i18n-nikki-zh-cn=y
+          # CONFIG_PACKAGE_mihomo is not set
+          # CONFIG_PACKAGE_mihomo-meta is not set
+          # CONFIG_PACKAGE_mihomo-alpha is not set
+          CONFIG_PACKAGE_rtp2httpd=y
+          CONFIG_PACKAGE_luci-app-rtp2httpd=y
+          CONFIG_PACKAGE_luci-i18n-rtp2httpd-zh-cn=y
+          PRO_EOF
+          }
+
+          verify_config() {
+            local edition="$1"
+            make defconfig
+            sed -i 's/^CONFIG_FEED_nikki=y/# CONFIG_FEED_nikki is not set/g' .config
+            sed -i 's/^CONFIG_FEED_video=y/# CONFIG_FEED_video is not set/g' .config
+
+            for dev in "${TARGET_ARR[@]}"; do
+              local prof="${PROFILE_MAP[$dev]}"
+              if [ "${#TARGET_ARR[@]}" -gt 1 ]; then
+                grep -qE "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${prof}=y$" .config || {
+                  echo "::error::Multi-Profile 設備 (${prof}) 未成功寫入 .config！"
+                  exit 1
+                }
+              else
+                grep -qE "^CONFIG_TARGET_mediatek_filogic_DEVICE_${prof}=y$" .config || {
+                  echo "::error::單機設備 (${prof}) 未成功寫入 .config！"
+                  exit 1
+                }
+              fi
+            done
+
+            echo "::group::審計 [${edition}] 關鍵套件與發行版配置"
+            grep -E '^(VERSION_DIST|VERSION_NUMBER):=' include/version.mk || true
+            grep -E '^CONFIG_PACKAGE_(luci-theme-argon|luci-app-ttyd|openssh-sftp-server|openssh-sftp-avahi-service|kmod-tcp-bbr|kmod-netlink-diag|kmod-inet-diag|kmod-nft-socket|kmod-nft-tproxy|kmod-tun|kmod-usb-net-rndis|kmod-usb-net-qmi-wwan|kmod-usb-net-cdc-mbim|kmod-usb-serial-option|luci-proto-qmi|luci-proto-mbim|luci-proto-ncm|nikki|luci-app-nikki|rtp2httpd|luci-app-rtp2httpd)=' .config || true
+            echo "::endgroup::"
+          }
+
+          safe_download() {
+            make download -j"$(nproc)" || make download -j4
+            local bad_files
+            bad_files=$(find dl -maxdepth 1 -type f -size -1024c ! -name "*.hash" 2>/dev/null || true)
+            if [ -n "$bad_files" ]; then
+              echo "發現損壞小檔案，重新下載："
+              printf '%s\n' "$bad_files"
+              find dl -maxdepth 1 -type f -size -1024c ! -name "*.hash" -delete
+              make download -j4 V=s
+            fi
+          }
+
+          detect_img_version() {
+            local ver=""
+            if [ -f .config ]; then
+              local cfg_ver
+              cfg_ver=$(grep -E '^CONFIG_VERSION_NUMBER=' .config 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+              if [ -n "$cfg_ver" ] && [ "$cfg_ver" != "y" ]; then
+                ver="$cfg_ver"
+              fi
+            fi
+            if [ -z "$ver" ]; then
+              ver=$(grep -E '^VERSION_NUMBER:=' include/version.mk 2>/dev/null \
+                | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?(-[a-zA-Z0-9]+)?' | awk 'NR==1' || true)
+            fi
+            echo "${ver:-${RESOLVED_VER}}"
+          }
+
+          collect_and_verify() {
+            local edition="$1"
+            local img_ver="$2"
+            local target_dir
+            target_dir=$(find bin/targets -mindepth 2 -maxdepth 2 -type d | awk 'NR==1')
+            if [ -z "$target_dir" ] || [ ! -d "$target_dir" ]; then
+              echo "::error::找不到目標韌體目錄 bin/targets/*/*"
+              exit 1
+            fi
+
+            shopt -s nullglob
+            for dev in "${TARGET_ARR[@]}"; do
+              local prof="${PROFILE_MAP[$dev]}"
+              local matches=("${target_dir}"/*-"${prof}-squashfs-sysupgrade.${IMG_FMT}")
+              if [ "${#matches[@]}" -ne 1 ]; then
+                echo "::error::[${edition}] 機型 ${dev} (Profile: ${prof}) 預期產出 1 個 .${IMG_FMT}，實際找到 ${#matches[@]} 個！"
+                ls -la "$target_dir"
+                exit 1
+              fi
+
+              local src_file="${matches[0]}"
+              local magic_hex
+              magic_hex=$(xxd -p -l 4 "$src_file" 2>/dev/null || true)
+              echo "驗證 [${edition}] ${dev} ($(basename "$src_file")) 檔頭魔數: 0x${magic_hex}"
+
+              if [ "$IMG_FMT" = "itb" ]; then
+                if [ "$magic_hex" != "d00dfeed" ]; then
+                  echo "::error::${src_file} 檔頭 (0x${magic_hex}) 非原生 FIT/ITB (0xd00dfeed)！"
+                  exit 1
+                fi
+              else
+                if [ "$dev" = "cudy_tr3000-v1" ] && [ "$magic_hex" != "55424923" ]; then
+                  echo "::error::cudy_tr3000-v1 檔頭 (0x${magic_hex}) 非原生 UBI# (0x55424923)！"
+                  exit 1
+                fi
+                if [ "$dev" != "cudy_tr3000-v1" ] && [ "$magic_hex" != "73797375" ]; then
+                  echo "::error::eMMC 機型 ${dev} 檔頭 (0x${magic_hex}) 非原生 sysupgrade-tar (0x73797375)！"
+                  exit 1
+                fi
+              fi
+
+              local new_name="${dev}-${img_ver}-squashfs-sysupgrade-${edition}.${IMG_FMT}"
+              cp -f "$src_file" "$GITHUB_WORKSPACE/collected_firmware/${new_name}"
+              echo "[OK] 歸檔完成: ${new_name} (Header: 0x${magic_hex}, Size: $(du -h "$src_file" | cut -f1))"
+            done
+          }
+
+          ccache -z >/dev/null 2>&1 || true
+
+          FIRST_PASS="true"
+          IMG_VERSION=""
+
+          for EDITION in "${VARIANT_ARR[@]}"; do
+            PASS_START=$(date +%s)
+            echo "================================================================="
+            echo ">>> 開始建置版本: ${EDITION} (機型: ${TARGETS} | 格式: ${IMG_FMT})"
+            echo "================================================================="
+
+            if [ "$EDITION" = "Pro" ]; then
+              # 僅在 Pro 階段部署 mihomo Alpha-Smart 雙路徑，確保 Std 映像完全純淨
+              mkdir -p files/usr/libexec files/usr/bin
+              cp -f /tmp/mihomo-smart files/usr/libexec/mihomo
+              chmod 0755 files/usr/libexec/mihomo
+              ln -sf ../libexec/mihomo files/usr/bin/mihomo
+              ls -lh files/usr/libexec/mihomo files/usr/bin/mihomo
+            fi
+
+            if [ "$FIRST_PASS" = "true" ]; then
+              write_base_config
+              [ "$EDITION" = "Pro" ] && append_pro_config
+              verify_config "$EDITION"
+              echo "::group::下載編譯依賴包 (${EDITION})"
+              safe_download
+              echo "::endgroup::"
+              FIRST_PASS="false"
+            else
+              # 增量進入 Pass 2 (Std -> Pro)：
+              # 100% 重用已編譯的工具鏈、Linux 核心與基礎套件，徹底清除舊 RootFS、squashfs 與輸出目錄防殘留
+              append_pro_config
+              verify_config "$EDITION"
+              echo "::group::補充下載 Pro 專屬套件源碼"
+              safe_download
+              echo "::endgroup::"
+              rm -rf \
+                bin/targets \
+                build_dir/target-*/root* \
+                build_dir/target-*/linux-mediatek_filogic/root* \
+                build_dir/target-*/linux-mediatek_filogic/tmp
+            fi
+
+            echo "使用 $(nproc) 執行緒編譯 ${EDITION}..."
+            make -j"$(nproc)" || make -j1 V=s
+
+            IMG_VERSION=$(detect_img_version)
+            collect_and_verify "$EDITION" "$IMG_VERSION"
+
+            PASS_END=$(date +%s)
+            echo "[完成] ${EDITION} 階段耗時: $(( (PASS_END - PASS_START) / 60 )) 分 $(( (PASS_END - PASS_START) % 60 )) 秒"
+            df -hT /
+          done
+
+          # 若同時編譯 Std 與 Pro，驗證每個機型的 Pro 檔案體積確實大於 Std，雙重防範舊映像誤打包
+          if [ "${#VARIANT_ARR[@]}" -eq 2 ]; then
+            for dev in "${TARGET_ARR[@]}"; do
+              std_f="$GITHUB_WORKSPACE/collected_firmware/${dev}-${IMG_VERSION}-squashfs-sysupgrade-Std.${IMG_FMT}"
+              pro_f="$GITHUB_WORKSPACE/collected_firmware/${dev}-${IMG_VERSION}-squashfs-sysupgrade-Pro.${IMG_FMT}"
+              std_sz=$(stat -c%s "$std_f")
+              pro_sz=$(stat -c%s "$pro_f")
+              if [ "$pro_sz" -le "$std_sz" ]; then
+                echo "::error::異常檢測：${dev} Pro 映像 (${pro_sz}B) 未大於 Std 映像 (${std_sz}B)，可能未正確打包 Pro 套件！"
+                exit 1
+              fi
+            done
+          fi
+
+          echo "::group::ccache 命中率與產物總覽"
+          ccache -s || true
+          ls -lh "$GITHUB_WORKSPACE/collected_firmware/"
+          echo "::endgroup::"
+
+          echo "img_version=${IMG_VERSION}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### ImmortalWrt 編譯報告"
+            echo "- **版本號**: \`${IMG_VERSION}\` (\`${SOURCE_REF}\`)"
+            echo "- **原生格式**: \`${IMG_FMT}\`"
+            echo "- **編譯機型**: \`${TARGETS}\`"
+            echo "- **編譯規格**: \`${VARIANTS}\`"
+            echo ""
+            echo "| 韌體檔案 | 檔案大小 |"
+            echo "| :--- | ---: |"
+            for fw in "$GITHUB_WORKSPACE/collected_firmware"/*; do
+              echo "| \`$(basename "$fw")\` | $(du -h "$fw" | cut -f1) |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上傳全部已校驗韌體成果 (Upload Consolidated Artifacts)
+        uses: actions/upload-artifact@v7
+        with:
+          name: firmwares-${{ needs.prepare.outputs.resolved_ver }}-${{ needs.prepare.outputs.img_fmt }}
+          path: collected_firmware/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ===========================================================================
+  # 階段 3：統一校驗與發布至 GitHub Releases
+  # 獨立權限與可重試設計，動態匹配格式並嚴格校驗完整性
+  # ===========================================================================
+  release:
+    name: 統一發布至 Releases (Consolidated Release)
+    needs: [prepare, build]
+    if: ${{ success() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: 下載編譯成果 (Download Firmware Artifacts)
+        uses: actions/download-artifact@v8
+        with:
+          name: firmwares-${{ needs.prepare.outputs.resolved_ver }}-${{ needs.prepare.outputs.img_fmt }}
+          path: all_firmwares
+
+      - name: 驗證檔案完整性並生成發布說明 (Verify & Prepare Release Notes)
+        id: prep_release
+        env:
+          BUILD_START_TIME: ${{ needs.prepare.outputs.build_start_time }}
+          UPSTREAM_COMMIT_TIME: ${{ needs.build.outputs.upstream_commit_time }}
+          UPSTREAM_COMMIT_HASH: ${{ needs.build.outputs.upstream_commit_hash }}
+          DETECTED_VER: ${{ needs.build.outputs.img_version || needs.prepare.outputs.resolved_ver }}
+          IMG_FMT: ${{ needs.prepare.outputs.img_fmt }}
+          EXPECTED_COUNT: ${{ needs.prepare.outputs.expected_count }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_DATE=$(TZ=Asia/Taipei date "+%Y-%m-%d")
+          FINISH_TIME=$(TZ=Asia/Taipei date "+%Y年%m月%d日 %H時%M分")
+          RELEASE_TAG="v${RELEASE_DATE}-Build-${{ github.run_number }}"
+          IMG_FMT_UPPER=$(echo "$IMG_FMT" | tr '[:lower:]' '[:upper:]')
+
+          cd all_firmwares
+          shopt -s nullglob
+          FW_FILES=(*."${IMG_FMT}")
+          ACTUAL_COUNT="${#FW_FILES[@]}"
+
+          if [ "$ACTUAL_COUNT" -ne "$EXPECTED_COUNT" ]; then
+            echo "::error::韌體檔案數量異常！預期 ${EXPECTED_COUNT} 個 .${IMG_FMT}，實際收到 ${ACTUAL_COUNT} 個。"
+            ls -la
+            exit 1
+          fi
+
+          sha256sum "${FW_FILES[@]}" > sha256sums.txt
+          cd ..
+
+          if [ "$IMG_FMT" = "itb" ]; then
+            FMT_DESC="遵循 OpenWrt 官方主線 FIT（Flattened Image Tree，Magic \`0xd00dfeed\`）標準規範，適配主線 U-Boot Mod（\`fitblk\`）引導環境"
+            BOOT_ENV_NAND="OpenWrt U-Boot Mod (\`fitblk\`)"
+            BOOT_ENV_EMMC="OpenWrt U-Boot Mod (\`fitblk\`)"
+          else
+            FMT_DESC="針對 SPI-NAND（\`UBI#\` \`0x55424923\`）與 eMMC（\`sysupgrade-tar\` \`0x73797375\`）底層儲存架構深度封裝，完美適配 Yuzhii0718 \`bl-mt798x-dhcpd\` U-Boot 引導環境"
+            BOOT_ENV_NAND="Yuzhii \`bl-mt798x-dhcpd\` (112MB UBI)"
+            BOOT_ENV_EMMC="Yuzhii \`bl-mt798x-dhcpd\` (eMMC)"
+          fi
+
+          SHA256_CONTENT=$(cat all_firmwares/sha256sums.txt)
+
+          cat > release_notes.md << EOF
+          ## ImmortalWrt ${DETECTED_VER}
+
+          > 本版韌體於 **${BUILD_START_TIME}** 啟動雲端建置，完整同步 ImmortalWrt 官方主線截至 **${UPSTREAM_COMMIT_TIME}**（Commit \`${UPSTREAM_COMMIT_HASH}\`）之最新原始碼與安全更新。全系列採用原生 **${IMG_FMT_UPPER}** 映像封裝，${FMT_DESC}。
+
+          ### 系統概覽
+
+          | 項目 | 規格說明 |
+          | :--- | :--- |
+          | **系統版本** | ImmortalWrt \`${DETECTED_VER}\`（繁簡中文介面最佳化） |
+          | **韌體格式** | 原生 **\`${IMG_FMT_UPPER}\`** 封裝（通過硬體級二進位檔頭校驗） |
+          | **管理位址** | \`http://192.168.7.1\`（主機名稱：\`ImmortalWrt\`） |
+          | **登入憑證** | 帳號 \`root\`，預設免密碼 |
+          | **桌面主題** | \`Argon\` 現代化視覺介面 |
+          | **建置時間** | ${BUILD_START_TIME} 開編 · ${FINISH_TIME} 發佈（Build \`#${{ github.run_number }}\`） |
+
+          ### 版本陣容
+
+          提供 **Standard（\`Std\`）** 與 **Pro（\`Pro\`）** 兩款版本配置，兼顧純淨穩定與進階網路管理需求：
+
+          | 版本代號 | 版本定位 | 檔名標識 | 預載應用與服務 |
+          | :--- | :--- | :--- | :--- |
+          | **\`Std\`** | **Standard 標準基礎版** | \`*-Std.${IMG_FMT}\` | **Argon 視覺主題**（\`luci-theme-argon\`）、**Web 終端機**（\`luci-app-ttyd\`），並完整內建底層網路加速與 5G/4G 行動寬頻驅動 |
+          | **\`Pro\`** | **Professional 專業增強版** | \`*-Pro.${IMG_FMT}\` | 完整包含 **\`Std\`** 所有功能，額外整合 **Nikki 透明代理**（\`luci-app-nikki\`，預置官方最新 \`Alpha-Smart\` 核心）與 **IPTV 串流轉發**（\`luci-app-rtp2httpd\` 原生 C 高效能版） |
+
+          ### 核心架構與連線能力
+
+          - **TCP BBR 高速擁塞控制**：底層內建並預設啟用 \`kmod-tcp-bbr\` 演算法，顯著提升高頻寬吞吐表現並降低網路延遲。
+          - **5G / 4G 行動寬頻即插即用**：原生整合移遠（Quectel）、高通（Qualcomm）等蜂巢式網路模組與智慧型手機 USB 網路共享驅動，完整支援 QMI、MBIM、NCM、RNDIS 與 ECM 撥號協議及 \`picocom\` 終端工具，未接入模組時零記憶體佔用。
+          - **官方核心模組無縫擴充**：建置期自動依源碼核心版本對齊官方 \`kmods\` 軟體源校驗碼（\`vermagic\`），並預載 \`kmod-netlink-diag\`、\`kmod-inet-diag\`、\`kmod-nft-socket\`、\`kmod-nft-tproxy\` 與 \`kmod-tun\`，安裝各類網路工具免受核心版本相容性限制。
+          - **SFTP 與零配置網路發現**：內建 \`openssh-sftp-server\` 與 \`openssh-sftp-avahi-service\`（mDNS），開機即支援區域網路設備自動發現與加密檔案管理。
+
+          ### 支援機型與硬體規格
+
+          | 機型名稱 | 韌體目標代號 | 處理器與儲存配置 | 適配引導環境 |
+          | :--- | :--- | :--- | :--- |
+          | **Cudy TR3000 v1** | \`cudy_tr3000-v1\` | MediaTek MT7981B · 128MB SPI-NAND（112MB 大分區） | ${BOOT_ENV_NAND} |
+          | **京東雲無線寶 AX6000 百里** | \`jdcloud_re-cp-03\` | MediaTek MT7986A · eMMC 高速儲存 | ${BOOT_ENV_EMMC} |
+          | **中國移動 RAX3000M 算力版** | \`cmcc_rax3000m-emmc\` | MediaTek MT7981B · eMMC 高速儲存 | ${BOOT_ENV_EMMC} |
+
+          ### 檔案校驗 (SHA-256)
+
+          \`\`\`text
+          ${SHA256_CONTENT}
+          \`\`\`
+          EOF
+
+          {
+            echo "release_tag=${RELEASE_TAG}"
+            echo "detected_ver=${DETECTED_VER}"
+            echo "img_fmt_upper=${IMG_FMT_UPPER}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 發布至 GitHub Releases (Create Unified Release)
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.prep_release.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: "ImmortalWrt ${{ steps.prep_release.outputs.detected_ver }} (${{ steps.prep_release.outputs.img_fmt_upper }}) · ${{ steps.prep_release.outputs.release_tag }}"
+          body_path: release_notes.md
+          files: |
+            all_firmwares/*.${{ needs.prepare.outputs.img_fmt }}
+            all_firmwares/sha256sums.txt
+          token: ${{ secrets.GITHUB_TOKEN }}
+          generate_release_notes: false
+          fail_on_unmatched_files: true
