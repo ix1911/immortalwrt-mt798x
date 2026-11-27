@@ -3,6 +3,62 @@ name: ImmortalWrt 自動追蹤最新正式版與快照版 (BIN/ITB 雙原生格�
 on:
   workflow_dispatch:
     inputs:
+      # =======================================================================
+      # 插件模組管理區 (Y = 整合 / N = 不整合)
+      # 修改下方 default 可變更永久預設值，或在執行 Workflow 時直接於介面點選
+      # =======================================================================
+      plugin_nikki:
+        description: '【插件・Pro】Nikki 透明代理 + 最新 Alpha-Smart 核心 (Y=整合 / N=不整合)'
+        required: false
+        default: 'Y'
+        type: choice
+        options:
+          - 'Y'
+          - 'N'
+      plugin_rtp2httpd:
+        description: '【插件・Pro】rtp2httpd 原生 C 版 IPTV 串流轉發 (Y=整合 / N=不整合)'
+        required: false
+        default: 'Y'
+        type: choice
+        options:
+          - 'Y'
+          - 'N'
+      plugin_argon:
+        description: '【插件・基礎】Argon 視覺主題並設為預設主題 (Y=整合 / N=改回預設 Bootstrap)'
+        required: false
+        default: 'Y'
+        type: choice
+        options:
+          - 'Y'
+          - 'N'
+      plugin_ttyd:
+        description: '【插件・基礎】TTYD Web 網頁終端機 (Y=整合 / N=不整合)'
+        required: false
+        default: 'Y'
+        type: choice
+        options:
+          - 'Y'
+          - 'N'
+      plugin_sftp:
+        description: '【插件・基礎】OpenSSH SFTP 檔案管理 + Avahi mDNS 發現 (Y=整合 / N=不整合)'
+        required: false
+        default: 'Y'
+        type: choice
+        options:
+          - 'Y'
+          - 'N'
+      plugin_wwan:
+        description: '【插件・基礎】5G/4G 行動寬頻模組與手機 USB 共享驅動 (Y=整合 / N=不整合)'
+        required: false
+        default: 'Y'
+        type: choice
+        options:
+          - 'Y'
+          - 'N'
+
+      # =======================================================================
+      # 核心建置參數區
+      # =======================================================================
       source_branch:
         description: '選擇編譯版本 (預設 latest-release-1 為最新穩定版；自動追蹤最新 3 個穩定版與最新 1 個 SNAPSHOT 版)'
         required: false
@@ -54,14 +110,16 @@ defaults:
 
 env:
   TZ: Asia/Taipei
+  # 底層系統加速模組開關 (Y=整合 / N=不整合；GitHub Actions 單一工作流 inputs 上限為 10 項，故置於此處統一控制)
+  PLUGIN_BBR: 'Y'
 
 jobs:
   # ===========================================================================
-  # 階段 1：輕量元資料解析 (約 10~15 秒)
-  # 統一鎖定上游 Ref、版本號、時間戳與建置目標，避免多點查詢不一致
+  # 階段 1：輕量元資料與插件模組開關解析 (約 10~15 秒)
+  # 統一鎖定上游 Ref、版本號、時間戳、建置目標與各插件模組生效狀態
   # ===========================================================================
   prepare:
-    name: 解析建置版本與參數 (Prepare Metadata)
+    name: 解析建置版本與插件模組參數 (Prepare Metadata)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -73,11 +131,21 @@ jobs:
       targets: ${{ steps.meta.outputs.targets }}
       variants: ${{ steps.meta.outputs.variants }}
       need_pro: ${{ steps.meta.outputs.need_pro }}
+      need_nikki: ${{ steps.meta.outputs.need_nikki }}
+      need_rtp2httpd: ${{ steps.meta.outputs.need_rtp2httpd }}
+      has_pro_plugins: ${{ steps.meta.outputs.has_pro_plugins }}
+      enable_nikki: ${{ steps.meta.outputs.enable_nikki }}
+      enable_rtp2httpd: ${{ steps.meta.outputs.enable_rtp2httpd }}
+      enable_argon: ${{ steps.meta.outputs.enable_argon }}
+      enable_ttyd: ${{ steps.meta.outputs.enable_ttyd }}
+      enable_sftp: ${{ steps.meta.outputs.enable_sftp }}
+      enable_wwan: ${{ steps.meta.outputs.enable_wwan }}
+      enable_bbr: ${{ steps.meta.outputs.enable_bbr }}
       expected_count: ${{ steps.meta.outputs.expected_count }}
       build_start_time: ${{ steps.meta.outputs.build_start_time }}
       cache_week: ${{ steps.meta.outputs.cache_week }}
     steps:
-      - name: 查詢 ImmortalWrt 上游版本並鎖定建置參數
+      - name: 查詢 ImmortalWrt 上游版本並鎖定建置與插件參數
         id: meta
         run: |
           set -euo pipefail
@@ -95,6 +163,26 @@ jobs:
             done
           }
 
+          norm_yn() {
+            local val="${1:-Y}"
+            case "${val^^}" in
+              Y|YES|TRUE|1) echo "Y" ;;
+              N|NO|FALSE|0) echo "N" ;;
+              *)
+                echo "::error::無效的插件開關值 '${val}'，僅支援 Y 或 N！" >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          ENABLE_NIKKI=$(norm_yn "${{ inputs.plugin_nikki || 'Y' }}")
+          ENABLE_RTP2HTTPD=$(norm_yn "${{ inputs.plugin_rtp2httpd || 'Y' }}")
+          ENABLE_ARGON=$(norm_yn "${{ inputs.plugin_argon || 'Y' }}")
+          ENABLE_TTYD=$(norm_yn "${{ inputs.plugin_ttyd || 'Y' }}")
+          ENABLE_SFTP=$(norm_yn "${{ inputs.plugin_sftp || 'Y' }}")
+          ENABLE_WWAN=$(norm_yn "${{ inputs.plugin_wwan || 'Y' }}")
+          ENABLE_BBR=$(norm_yn "${PLUGIN_BBR:-Y}")
+
           BUILD_START_TIME=$(TZ=Asia/Taipei date "+%Y年%m月%d日 %H時%M分")
           CACHE_WEEK=$(TZ=Asia/Taipei date "+%G-W%V")
           CHOICE="${{ inputs.source_branch || 'latest-release-1' }}"
@@ -109,7 +197,6 @@ jobs:
             latest-release-1|latest-release-2|latest-release-3)
               RANK="${CHOICE##*-}"
               echo "正在查詢 ImmortalWrt 官方倉庫最新前 3 個正式版 Tag..."
-              # 先完整接收再由 awk 過濾，徹底避免 pipefail 下 head 提早關閉管道觸發 SIGPIPE
               REMOTE_TAGS=$(retry 3 git ls-remote --tags --sort=-v:refname \
                 https://github.com/immortalwrt/immortalwrt.git 'refs/tags/v[0-9]*')
               TOP3_TAGS=$(printf '%s\n' "$REMOTE_TAGS" \
@@ -173,15 +260,34 @@ jobs:
               ;;
           esac
 
+          NEED_NIKKI="false"
+          NEED_RTP2HTTPD="false"
+          HAS_PRO_PLUGINS="false"
+          if [ "$NEED_PRO" = "true" ]; then
+            [ "$ENABLE_NIKKI" = "Y" ] && NEED_NIKKI="true"
+            [ "$ENABLE_RTP2HTTPD" = "Y" ] && NEED_RTP2HTTPD="true"
+            if [ "$NEED_NIKKI" = "true" ] || [ "$NEED_RTP2HTTPD" = "true" ]; then
+              HAS_PRO_PLUGINS="true"
+            fi
+          fi
+
           EXPECTED_COUNT=$((TARGET_COUNT * VARIANT_COUNT))
 
           echo "鎖定建置參數："
           echo "  - Source Ref     : ${SOURCE_REF} (版本號: ${RESOLVED_VER})"
           echo "  - Image Format   : ${IMG_FMT}"
           echo "  - Targets        : ${TARGETS}"
-          echo "  - Variants       : ${VARIANTS} (需整合 Pro: ${NEED_PRO})"
+          echo "  - Variants       : ${VARIANTS} (編譯 Pro: ${NEED_PRO} | 啟用 Pro 插件: ${HAS_PRO_PLUGINS})"
           echo "  - Expected Files : ${EXPECTED_COUNT}"
           echo "  - Start Time     : ${BUILD_START_TIME}"
+          echo "插件模組開關狀態 (Y=整合 / N=不整合)："
+          echo "  - [Pro]  Nikki + Alpha-Smart : ${ENABLE_NIKKI} (實際拉取: ${NEED_NIKKI})"
+          echo "  - [Pro]  rtp2httpd 原生 C 版 : ${ENABLE_RTP2HTTPD} (實際拉取: ${NEED_RTP2HTTPD})"
+          echo "  - [基礎] Argon 視覺主題      : ${ENABLE_ARGON}"
+          echo "  - [基礎] TTYD Web 終端機     : ${ENABLE_TTYD}"
+          echo "  - [基礎] SFTP + Avahi mDNS   : ${ENABLE_SFTP}"
+          echo "  - [基礎] 5G/4G 行動寬頻驅動  : ${ENABLE_WWAN}"
+          echo "  - [系統] TCP BBR 擁塞控制    : ${ENABLE_BBR}"
 
           {
             echo "source_ref=${SOURCE_REF}"
@@ -190,6 +296,16 @@ jobs:
             echo "targets=${TARGETS}"
             echo "variants=${VARIANTS}"
             echo "need_pro=${NEED_PRO}"
+            echo "need_nikki=${NEED_NIKKI}"
+            echo "need_rtp2httpd=${NEED_RTP2HTTPD}"
+            echo "has_pro_plugins=${HAS_PRO_PLUGINS}"
+            echo "enable_nikki=${ENABLE_NIKKI}"
+            echo "enable_rtp2httpd=${ENABLE_RTP2HTTPD}"
+            echo "enable_argon=${ENABLE_ARGON}"
+            echo "enable_ttyd=${ENABLE_TTYD}"
+            echo "enable_sftp=${ENABLE_SFTP}"
+            echo "enable_wwan=${ENABLE_WWAN}"
+            echo "enable_bbr=${ENABLE_BBR}"
             echo "expected_count=${EXPECTED_COUNT}"
             echo "build_start_time=${BUILD_START_TIME}"
             echo "cache_week=${CACHE_WEEK}"
@@ -219,6 +335,16 @@ jobs:
       TARGETS: ${{ needs.prepare.outputs.targets }}
       VARIANTS: ${{ needs.prepare.outputs.variants }}
       NEED_PRO: ${{ needs.prepare.outputs.need_pro }}
+      NEED_NIKKI: ${{ needs.prepare.outputs.need_nikki }}
+      NEED_RTP2HTTPD: ${{ needs.prepare.outputs.need_rtp2httpd }}
+      HAS_PRO_PLUGINS: ${{ needs.prepare.outputs.has_pro_plugins }}
+      ENABLE_NIKKI: ${{ needs.prepare.outputs.enable_nikki }}
+      ENABLE_RTP2HTTPD: ${{ needs.prepare.outputs.enable_rtp2httpd }}
+      ENABLE_ARGON: ${{ needs.prepare.outputs.enable_argon }}
+      ENABLE_TTYD: ${{ needs.prepare.outputs.enable_ttyd }}
+      ENABLE_SFTP: ${{ needs.prepare.outputs.enable_sftp }}
+      ENABLE_WWAN: ${{ needs.prepare.outputs.enable_wwan }}
+      ENABLE_BBR: ${{ needs.prepare.outputs.enable_bbr }}
       # ccache 效能調優：壓縮儲存、跨機型/格式共用、提升命中率
       CCACHE_DIR: ${{ github.workspace }}/openwrt/.ccache
       CCACHE_COMPRESS: "true"
@@ -266,8 +392,8 @@ jobs:
             squashfs-tools swig texinfo time u-boot-tools unzip wget xsltproc \
             xxd xz-utils zlib1g-dev zstd
 
-          # 僅在編譯 Pro 版時安裝 UPX (配合 rstrip.sh 白名單保護，壓縮 mihomo 體積)
-          if [ "$NEED_PRO" = "true" ]; then
+          # 僅在啟用 Nikki 模組時安裝 UPX (配合 rstrip.sh 白名單保護，壓縮 mihomo 體積)
+          if [ "$NEED_NIKKI" = "true" ]; then
             UPX_VER="4.2.4"
             if curl -fsSL --retry 3 --retry-delay 2 \
               "https://github.com/upx/upx/releases/download/v${UPX_VER}/upx-${UPX_VER}-amd64_linux.tar.xz" \
@@ -277,7 +403,7 @@ jobs:
               rm -rf /tmp/upx*
               upx --version | awk 'NR==1'
             else
-              echo "::warning::UPX 下載失敗，Pro 版 mihomo 將保留未壓縮原檔"
+              echo "::warning::UPX 下載失敗，Nikki 預置的 mihomo 核心將保留未壓縮原檔"
             fi
           fi
 
@@ -604,7 +730,6 @@ jobs:
               ps = re.sub(r'^\s*(cmcc,rax3000m|jdcloud,re-cp-03)\|\\\n', '', ps, flags=re.M)
               ps = ps.replace('CI_KERNPART="production"', 'CI_KERNPART="kernel"\n\t\tCI_ROOTPART="rootfs"')
 
-              # 主錨點 + 備用錨點，兼顧縮排對齊、抗重構韌性與 Fail-Fast 安全斷言
               ps, n1 = re.subn(
                   r'^([ \t]*)(acer,predator-w6\|\\\n)',
                   r'\1cmcc,rax3000m|\\\n\1jdcloud,re-cp-03|\\\n\1\2',
@@ -672,7 +797,7 @@ jobs:
           sed -n '/^define Device\/cudy_tr3000-v1/,/^endef/p' target/linux/mediatek/image/*.mk
           echo "::endgroup::"
 
-      - name: 更新軟體源與整合外部插件 (Update Feeds & Extra Plugins)
+      - name: 更新軟體源並依模組開關整合外部插件 (Update Feeds & Modular Plugins)
         working-directory: ./openwrt
         run: |
           set -euo pipefail
@@ -688,15 +813,16 @@ jobs:
             done
           }
 
-          echo "::group::更新並安裝 Feeds"
-          if [ "$NEED_PRO" = "true" ]; then
+          # -------------------------------------------------------------------
+          # 模組化插件前置/後置整合函式 (依 Y/N 開關獨立啟停)
+          # -------------------------------------------------------------------
+          mod_nikki_pre_feed() {
+            echo "[模組][Nikki] 註冊 OpenWrt-nikki 軟體源..."
             echo "src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main" >> feeds.conf.default
-          fi
+          }
 
-          retry 3 ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-          if [ "$NEED_PRO" = "true" ]; then
+          mod_nikki_post_feed() {
+            echo "[模組][Nikki] 安裝 nikki feed、移除原版 mihomo 依賴並套用 rstrip.sh 白名單..."
             ./scripts/feeds install -a -f -p nikki
 
             # 移除 nikki 對任何 mihomo 變體二進位的強制依賴 (相容多段命名、空白、續行符 \ 與行尾)
@@ -706,16 +832,56 @@ jobs:
               fi
             done
 
-            # 保護自訂 mihomo 核心不被 OpenWrt rstrip.sh 剝離符號破壞並驗證生效
+            # 保護自訂 mihomo 核心不被 OpenWrt rstrip.sh 剝離符號破壞
+            # 修復：相容上游 find $TARGETS -not -path \*/lib/firmware/\* -type f 等任意中間參數及 while read 備援
             if [ -f scripts/rstrip.sh ]; then
-              sed -i -E 's/(find "?\$TARGETS"? -type f)/\1 ! -name "mihomo*"/g' scripts/rstrip.sh
-              if ! grep -q 'mihomo\*' scripts/rstrip.sh; then
-                echo "::error::scripts/rstrip.sh 白名單規則套用失敗！"
-                exit 1
-              fi
-            fi
+              python3 - << 'PYEOF'
+          import re
+          import sys
 
-            # 清理舊版 rtp2httpd 並引入官方最新原生 C 版
+          path = "scripts/rstrip.sh"
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          if "mihomo*" in content:
+              print("[OK] scripts/rstrip.sh 已包含 mihomo* 白名單規則")
+              sys.exit(0)
+
+          # 策略 1：匹配 find $TARGETS ... -type f (相容中間含 -not -path 等任意參數或跨行續行)
+          new_content, n = re.subn(
+              r'(find\s+"?\$\{?TARGETS\}?"?(?:[^\n]|\\\n)*?\s-type\s+f)\b',
+              r'\1 ! -name "mihomo*"',
+              content,
+          )
+
+          # 策略 2（備援）：若上游改寫 find 結構，改於 while read 迴圈起點直接略過 mihomo*
+          if n == 0:
+              new_content, n = re.subn(
+                  r'(while\s+read(?:\s+-r)?\s+([A-Za-z_][A-Za-z0-9_]*)\b[^\n]*(?:;\s*|\n\s*)do\n)',
+                  r'\1\t\tcase "${\2}" in *mihomo*) echo "$SELF: ${\2}: skipped (mihomo* whitelist)"; continue ;; esac\n',
+                  content,
+              )
+
+          if n == 0:
+              print("::error::scripts/rstrip.sh 白名單規則套用失敗！以下為相關行號供排查：", file=sys.stderr)
+              for idx, line in enumerate(content.splitlines(), 1):
+                  if any(k in line for k in ("find", "TARGETS", "while", "read")):
+                      print(f"  L{idx}: {line}", file=sys.stderr)
+              sys.exit(1)
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(new_content)
+
+          print(f"[OK] 已於 {path} 成功套用 mihomo* 白名單規則 (更新 {n} 處)：")
+          for idx, line in enumerate(new_content.splitlines(), 1):
+              if "mihomo*" in line:
+                  print(f"  L{idx}: {line.strip()}")
+          PYEOF
+            fi
+          }
+
+          mod_rtp2httpd_setup() {
+            echo "[模組][rtp2httpd] 清理舊版並引入官方最新原生 C 版..."
             rm -rf \
               feeds/packages/net/rtp2httpd \
               feeds/luci/applications/luci-app-rtp2httpd \
@@ -731,10 +897,22 @@ jobs:
             [ -f package/rtp2httpd/Makefile.versioned ] && mv -f package/rtp2httpd/Makefile.versioned package/rtp2httpd/Makefile
             [ -f package/luci-app-rtp2httpd/Makefile.versioned ] && mv -f package/luci-app-rtp2httpd/Makefile.versioned package/luci-app-rtp2httpd/Makefile
             rm -rf /tmp/rtp2httpd
-          fi
+          }
 
-          # 強制將 LuCI 集合預設主題由 bootstrap 改為 Argon
-          find feeds/luci/collections/ -name "Makefile" -exec sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' {} + || true
+          mod_argon_setup() {
+            echo "[模組][Argon] 將 LuCI 集合預設主題由 bootstrap 替換為 Argon..."
+            find feeds/luci/collections/ -name "Makefile" -exec sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' {} + || true
+          }
+
+          echo "::group::更新並安裝 Feeds 與啟用之插件模組"
+          [ "$NEED_NIKKI" = "true" ] && mod_nikki_pre_feed
+
+          retry 3 ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          [ "$NEED_NIKKI" = "true" ] && mod_nikki_post_feed
+          [ "$NEED_RTP2HTTPD" = "true" ] && mod_rtp2httpd_setup
+          [ "$ENABLE_ARGON" = "Y" ] && mod_argon_setup
           echo "::endgroup::"
 
       - name: 配置品牌標識、LAN IP、TCP BBR 與核心對齊的官方 kmods (Configure Branding & Vermagic)
@@ -815,7 +993,6 @@ jobs:
           done
 
           if [ "${#OFFICIAL_VERMAGIC}" -eq 32 ] && [ -f include/kernel-defaults.mk ]; then
-            # 使用 Python 精準改寫並保留 Makefile Tab 縮排，杜絕 sed 跳脫錯誤與管線 SIGPIPE
             python3 - "$OFFICIAL_VERMAGIC" << 'PYEOF'
           import re
           import sys
@@ -842,11 +1019,14 @@ jobs:
             echo "::warning::未找到核心相符之官方 kmods 目錄，將使用編譯自動生成的 vermagic"
           fi
 
-          # 4. 預設啟用 TCP BBR
-          mkdir -p files/etc/sysctl.d files/etc/uci-defaults
-          cat > files/etc/sysctl.d/99-turboacc-bbr.conf << 'EOF'
+          # 4. 依模組開關預設啟用 TCP BBR
+          mkdir -p files/etc/uci-defaults
+          if [ "$ENABLE_BBR" = "Y" ]; then
+            mkdir -p files/etc/sysctl.d
+            cat > files/etc/sysctl.d/99-turboacc-bbr.conf << 'EOF'
           net.ipv4.tcp_congestion_control=bbr
           EOF
+          fi
 
           # 5. 建立 99-z-change-lan-ip (安全變數標頭 + 單引號 Heredoc，完整相容 apk/opkg、多級鏡像與 release/snapshot)
           {
@@ -901,8 +1081,8 @@ jobs:
           } > files/etc/uci-defaults/99-z-change-lan-ip
           chmod 0755 files/etc/uci-defaults/99-z-change-lan-ip
 
-      - name: 預下載並驗證 Pro 版 Alpha-Smart 核心 (Stage Smart Core)
-        if: ${{ needs.prepare.outputs.need_pro == 'true' }}
+      - name: 預下載並驗證 Nikki 專用 Alpha-Smart 核心 (Stage Smart Core)
+        if: ${{ needs.prepare.outputs.need_nikki == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -1012,6 +1192,97 @@ jobs:
             echo "機型映射: ${dev} -> Profile [${PROFILE_MAP[$dev]}]"
           done
 
+          # -------------------------------------------------------------------
+          # 模組化 .config 配置生成器 (各插件獨立封裝，按 Y/N 開關組合)
+          # -------------------------------------------------------------------
+          append_mod_bbr() {
+            [ "$ENABLE_BBR" = "Y" ] || return 0
+            cat >> .config << 'MOD_EOF'
+          CONFIG_PACKAGE_kmod-tcp-bbr=y
+          MOD_EOF
+          }
+
+          append_mod_argon() {
+            if [ "$ENABLE_ARGON" = "Y" ]; then
+              cat >> .config << 'MOD_EOF'
+          # CONFIG_PACKAGE_luci-theme-bootstrap is not set
+          CONFIG_PACKAGE_luci-theme-argon=y
+          MOD_EOF
+            else
+              cat >> .config << 'MOD_EOF'
+          CONFIG_PACKAGE_luci-theme-bootstrap=y
+          # CONFIG_PACKAGE_luci-theme-argon is not set
+          MOD_EOF
+            fi
+          }
+
+          append_mod_ttyd() {
+            [ "$ENABLE_TTYD" = "Y" ] || return 0
+            cat >> .config << 'MOD_EOF'
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
+          MOD_EOF
+          }
+
+          append_mod_sftp() {
+            [ "$ENABLE_SFTP" = "Y" ] || return 0
+            cat >> .config << 'MOD_EOF'
+          CONFIG_PACKAGE_openssh-sftp-server=y
+          CONFIG_PACKAGE_openssh-sftp-avahi-service=y
+          CONFIG_PACKAGE_avahi-dbus-daemon=y
+          MOD_EOF
+          }
+
+          append_mod_wwan() {
+            [ "$ENABLE_WWAN" = "Y" ] || return 0
+            cat >> .config << 'MOD_EOF'
+          CONFIG_PACKAGE_kmod-mii=y
+          CONFIG_PACKAGE_kmod-usb-wdm=y
+          CONFIG_PACKAGE_kmod-usb-acm=y
+          CONFIG_PACKAGE_kmod-usb-net=y
+          CONFIG_PACKAGE_kmod-usb-net-rndis=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-ether=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-ncm=y
+          CONFIG_PACKAGE_kmod-usb-net-huawei-cdc-ncm=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-mbim=y
+          CONFIG_PACKAGE_kmod-usb-net-qmi-wwan=y
+          CONFIG_PACKAGE_kmod-usb-serial=y
+          CONFIG_PACKAGE_kmod-usb-serial-wwan=y
+          CONFIG_PACKAGE_kmod-usb-serial-option=y
+          CONFIG_PACKAGE_kmod-usb-serial-qualcomm=y
+          CONFIG_PACKAGE_usb-modeswitch=y
+          CONFIG_PACKAGE_uqmi=y
+          CONFIG_PACKAGE_umbim=y
+          CONFIG_PACKAGE_comgt-ncm=y
+          CONFIG_PACKAGE_picocom=y
+          CONFIG_PACKAGE_luci-proto-3g=y
+          CONFIG_PACKAGE_luci-proto-qmi=y
+          CONFIG_PACKAGE_luci-proto-mbim=y
+          CONFIG_PACKAGE_luci-proto-ncm=y
+          MOD_EOF
+          }
+
+          append_mod_nikki() {
+            [ "$ENABLE_NIKKI" = "Y" ] || return 0
+            cat >> .config << 'MOD_EOF'
+          CONFIG_PACKAGE_nikki=y
+          CONFIG_PACKAGE_luci-app-nikki=y
+          CONFIG_PACKAGE_luci-i18n-nikki-zh-cn=y
+          # CONFIG_PACKAGE_mihomo is not set
+          # CONFIG_PACKAGE_mihomo-meta is not set
+          # CONFIG_PACKAGE_mihomo-alpha is not set
+          MOD_EOF
+          }
+
+          append_mod_rtp2httpd() {
+            [ "$ENABLE_RTP2HTTPD" = "Y" ] || return 0
+            cat >> .config << 'MOD_EOF'
+          CONFIG_PACKAGE_rtp2httpd=y
+          CONFIG_PACKAGE_luci-app-rtp2httpd=y
+          CONFIG_PACKAGE_luci-i18n-rtp2httpd-zh-cn=y
+          MOD_EOF
+          }
+
           write_base_config() {
             rm -rf tmp .config
             cat > .config << 'CFG_EOF'
@@ -1044,43 +1315,19 @@ jobs:
           CONFIG_PACKAGE_luci-compat=y
           CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
           CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
-          CONFIG_PACKAGE_openssh-sftp-server=y
-          CONFIG_PACKAGE_openssh-sftp-avahi-service=y
-          CONFIG_PACKAGE_avahi-dbus-daemon=y
-          CONFIG_PACKAGE_kmod-tcp-bbr=y
           CONFIG_PACKAGE_kmod-netlink-diag=y
           CONFIG_PACKAGE_kmod-inet-diag=y
           CONFIG_PACKAGE_kmod-nft-socket=y
           CONFIG_PACKAGE_kmod-nft-tproxy=y
           CONFIG_PACKAGE_kmod-tun=y
-          CONFIG_PACKAGE_kmod-mii=y
-          CONFIG_PACKAGE_kmod-usb-wdm=y
-          CONFIG_PACKAGE_kmod-usb-acm=y
-          CONFIG_PACKAGE_kmod-usb-net=y
-          CONFIG_PACKAGE_kmod-usb-net-rndis=y
-          CONFIG_PACKAGE_kmod-usb-net-cdc-ether=y
-          CONFIG_PACKAGE_kmod-usb-net-cdc-ncm=y
-          CONFIG_PACKAGE_kmod-usb-net-huawei-cdc-ncm=y
-          CONFIG_PACKAGE_kmod-usb-net-cdc-mbim=y
-          CONFIG_PACKAGE_kmod-usb-net-qmi-wwan=y
-          CONFIG_PACKAGE_kmod-usb-serial=y
-          CONFIG_PACKAGE_kmod-usb-serial-wwan=y
-          CONFIG_PACKAGE_kmod-usb-serial-option=y
-          CONFIG_PACKAGE_kmod-usb-serial-qualcomm=y
-          CONFIG_PACKAGE_usb-modeswitch=y
-          CONFIG_PACKAGE_uqmi=y
-          CONFIG_PACKAGE_umbim=y
-          CONFIG_PACKAGE_comgt-ncm=y
-          CONFIG_PACKAGE_picocom=y
-          CONFIG_PACKAGE_luci-proto-3g=y
-          CONFIG_PACKAGE_luci-proto-qmi=y
-          CONFIG_PACKAGE_luci-proto-mbim=y
-          CONFIG_PACKAGE_luci-proto-ncm=y
-          # CONFIG_PACKAGE_luci-theme-bootstrap is not set
-          CONFIG_PACKAGE_luci-theme-argon=y
-          CONFIG_PACKAGE_luci-app-ttyd=y
-          CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
           CFG_EOF
+
+            # 掛載已啟用之基礎插件模組
+            append_mod_bbr
+            append_mod_argon
+            append_mod_ttyd
+            append_mod_sftp
+            append_mod_wwan
 
             if [ "${#TARGET_ARR[@]}" -gt 1 ]; then
               {
@@ -1099,17 +1346,8 @@ jobs:
           }
 
           append_pro_config() {
-            cat >> .config << 'PRO_EOF'
-          CONFIG_PACKAGE_nikki=y
-          CONFIG_PACKAGE_luci-app-nikki=y
-          CONFIG_PACKAGE_luci-i18n-nikki-zh-cn=y
-          # CONFIG_PACKAGE_mihomo is not set
-          # CONFIG_PACKAGE_mihomo-meta is not set
-          # CONFIG_PACKAGE_mihomo-alpha is not set
-          CONFIG_PACKAGE_rtp2httpd=y
-          CONFIG_PACKAGE_luci-app-rtp2httpd=y
-          CONFIG_PACKAGE_luci-i18n-rtp2httpd-zh-cn=y
-          PRO_EOF
+            append_mod_nikki
+            append_mod_rtp2httpd
           }
 
           verify_config() {
@@ -1133,24 +1371,42 @@ jobs:
               fi
             done
 
-            # Pro 雙向強斷言：確保增強套件已啟用且絕未拉入任何原版 mihomo 套件
-            if [ "$edition" = "Pro" ]; then
-              for req_pkg in nikki luci-app-nikki rtp2httpd luci-app-rtp2httpd; do
-                grep -qE "^CONFIG_PACKAGE_${req_pkg}=y$" .config || {
-                  echo "::error::[Pro] 必要套件 ${req_pkg} 未啟用，請檢查上游依賴是否變更！"
-                  exit 1
-                }
-              done
-              if grep -qE '^CONFIG_PACKAGE_mihomo.*=y$' .config; then
-                echo "::error::[Pro] 偵測到原版 mihomo 套件被重新啟用，將導致核心重複打包溢出分區！"
-                grep -E '^CONFIG_PACKAGE_mihomo.*=y$' .config
+            # 依模組開關執行精準斷言
+            if [ "$ENABLE_ARGON" = "Y" ]; then
+              grep -qE '^CONFIG_PACKAGE_luci-theme-argon=y$' .config || {
+                echo "::error::[Argon] 已啟用但未成功寫入 .config！"
                 exit 1
+              }
+            fi
+
+            if [ "$edition" = "Pro" ]; then
+              if [ "$ENABLE_NIKKI" = "Y" ]; then
+                for req_pkg in nikki luci-app-nikki; do
+                  grep -qE "^CONFIG_PACKAGE_${req_pkg}=y$" .config || {
+                    echo "::error::[Pro][Nikki] 必要套件 ${req_pkg} 未啟用，請檢查上游依賴是否變更！"
+                    exit 1
+                  }
+                done
+                if grep -qE '^CONFIG_PACKAGE_mihomo.*=y$' .config; then
+                  echo "::error::[Pro][Nikki] 偵測到原版 mihomo 套件被重新啟用，將導致核心重複打包溢出分區！"
+                  grep -E '^CONFIG_PACKAGE_mihomo.*=y$' .config
+                  exit 1
+                fi
+              fi
+
+              if [ "$ENABLE_RTP2HTTPD" = "Y" ]; then
+                for req_pkg in rtp2httpd luci-app-rtp2httpd; do
+                  grep -qE "^CONFIG_PACKAGE_${req_pkg}=y$" .config || {
+                    echo "::error::[Pro][rtp2httpd] 必要套件 ${req_pkg} 未啟用，請檢查上游依賴是否變更！"
+                    exit 1
+                  }
+                done
               fi
             fi
 
             echo "::group::審計 [${edition}] 關鍵套件與發行版配置"
             grep -E '^(VERSION_DIST|VERSION_NUMBER):=' include/version.mk || true
-            grep -E '^CONFIG_PACKAGE_(luci-theme-argon|luci-app-ttyd|openssh-sftp-server|openssh-sftp-avahi-service|kmod-tcp-bbr|kmod-netlink-diag|kmod-inet-diag|kmod-nft-socket|kmod-nft-tproxy|kmod-tun|kmod-usb-net-rndis|kmod-usb-net-qmi-wwan|kmod-usb-net-cdc-mbim|kmod-usb-serial-option|luci-proto-qmi|luci-proto-mbim|luci-proto-ncm|nikki|luci-app-nikki|rtp2httpd|luci-app-rtp2httpd)=' .config || true
+            grep -E '^CONFIG_PACKAGE_(luci-theme-argon|luci-theme-bootstrap|luci-app-ttyd|openssh-sftp-server|openssh-sftp-avahi-service|kmod-tcp-bbr|kmod-netlink-diag|kmod-inet-diag|kmod-nft-socket|kmod-nft-tproxy|kmod-tun|kmod-usb-net-rndis|kmod-usb-net-qmi-wwan|kmod-usb-net-cdc-mbim|kmod-usb-serial-option|luci-proto-qmi|luci-proto-mbim|luci-proto-ncm|nikki|luci-app-nikki|rtp2httpd|luci-app-rtp2httpd)=' .config || true
             echo "::endgroup::"
           }
 
@@ -1240,8 +1496,8 @@ jobs:
             echo ">>> 開始建置版本: ${EDITION} (機型: ${TARGETS} | 格式: ${IMG_FMT})"
             echo "================================================================="
 
-            if [ "$EDITION" = "Pro" ]; then
-              # 僅在 Pro 階段部署 mihomo Alpha-Smart 雙路徑，確保 Std 映像完全純淨
+            if [ "$EDITION" = "Pro" ] && [ "$ENABLE_NIKKI" = "Y" ]; then
+              # 僅在 Pro 階段且啟用 Nikki 時部署 mihomo Alpha-Smart 雙路徑，確保 Std 映像完全純淨
               mkdir -p files/usr/libexec files/usr/bin
               cp -f /tmp/mihomo-smart files/usr/libexec/mihomo
               chmod 0755 files/usr/libexec/mihomo
@@ -1265,7 +1521,6 @@ jobs:
               echo "::group::補充下載 Pro 專屬套件源碼"
               safe_download
               echo "::endgroup::"
-              # 僅刪除 bin/targets 下的舊韌體映像與清單，完整保留 packages/ 內的已編譯 kmod 與基礎包
               find bin/targets -maxdepth 3 -type f -delete
               rm -rf \
                 build_dir/target-*/root* \
@@ -1285,18 +1540,22 @@ jobs:
             df -hT /
           done
 
-          # 若同時編譯 Std 與 Pro，驗證每個機型的 Pro 檔案體積確實大於 Std，雙重防範舊映像誤打包
+          # 若同時編譯 Std 與 Pro 且有啟用至少一個 Pro 插件，驗證 Pro 檔案體積確實大於 Std
           if [ "${#VARIANT_ARR[@]}" -eq 2 ]; then
-            for dev in "${TARGET_ARR[@]}"; do
-              std_f="$GITHUB_WORKSPACE/collected_firmware/${dev}-${IMG_VERSION}-squashfs-sysupgrade-Std.${IMG_FMT}"
-              pro_f="$GITHUB_WORKSPACE/collected_firmware/${dev}-${IMG_VERSION}-squashfs-sysupgrade-Pro.${IMG_FMT}"
-              std_sz=$(stat -c%s "$std_f")
-              pro_sz=$(stat -c%s "$pro_f")
-              if [ "$pro_sz" -le "$std_sz" ]; then
-                echo "::error::異常檢測：${dev} Pro 映像 (${pro_sz}B) 未大於 Std 映像 (${std_sz}B)，可能未正確打包 Pro 套件！"
-                exit 1
-              fi
-            done
+            if [ "$HAS_PRO_PLUGINS" = "true" ]; then
+              for dev in "${TARGET_ARR[@]}"; do
+                std_f="$GITHUB_WORKSPACE/collected_firmware/${dev}-${IMG_VERSION}-squashfs-sysupgrade-Std.${IMG_FMT}"
+                pro_f="$GITHUB_WORKSPACE/collected_firmware/${dev}-${IMG_VERSION}-squashfs-sysupgrade-Pro.${IMG_FMT}"
+                std_sz=$(stat -c%s "$std_f")
+                pro_sz=$(stat -c%s "$pro_f")
+                if [ "$pro_sz" -le "$std_sz" ]; then
+                  echo "::error::異常檢測：${dev} Pro 映像 (${pro_sz}B) 未大於 Std 映像 (${std_sz}B)，可能未正確打包 Pro 套件！"
+                  exit 1
+                fi
+              done
+            else
+              echo "::warning::Nikki 與 rtp2httpd 模組均設為 N，已略過 Pro > Std 體積差異校驗。"
+            fi
           fi
 
           echo "::group::ccache 命中率與產物總覽"
@@ -1312,6 +1571,17 @@ jobs:
             echo "- **原生格式**: \`${IMG_FMT}\`"
             echo "- **編譯機型**: \`${TARGETS}\`"
             echo "- **編譯規格**: \`${VARIANTS}\`"
+            echo ""
+            echo "#### 插件模組整合狀態"
+            echo "| 模組 | 層級 | 開關 |"
+            echo "| :--- | :--- | :---: |"
+            echo "| Nikki + Alpha-Smart | Pro | \`${ENABLE_NIKKI}\` |"
+            echo "| rtp2httpd (原生 C 版) | Pro | \`${ENABLE_RTP2HTTPD}\` |"
+            echo "| Argon 視覺主題 | 基礎 | \`${ENABLE_ARGON}\` |"
+            echo "| TTYD Web 終端機 | 基礎 | \`${ENABLE_TTYD}\` |"
+            echo "| SFTP + Avahi mDNS | 基礎 | \`${ENABLE_SFTP}\` |"
+            echo "| 5G/4G 行動寬頻驅動 | 基礎 | \`${ENABLE_WWAN}\` |"
+            echo "| TCP BBR 擁塞控制 | 系統 | \`${ENABLE_BBR}\` |"
             echo ""
             echo "| 韌體檔案 | 檔案大小 |"
             echo "| :--- | ---: |"
@@ -1330,7 +1600,7 @@ jobs:
 
   # ===========================================================================
   # 階段 3：統一校驗與發布至 GitHub Releases
-  # 獨立權限與可重試設計，動態匹配格式並嚴格校驗完整性
+  # 獨立權限與可重試設計，動態匹配格式、插件模組狀態並嚴格校驗完整性
   # ===========================================================================
   release:
     name: 統一發布至 Releases (Consolidated Release)
@@ -1356,6 +1626,13 @@ jobs:
           DETECTED_VER: ${{ needs.build.outputs.img_version || needs.prepare.outputs.resolved_ver }}
           IMG_FMT: ${{ needs.prepare.outputs.img_fmt }}
           EXPECTED_COUNT: ${{ needs.prepare.outputs.expected_count }}
+          ENABLE_NIKKI: ${{ needs.prepare.outputs.enable_nikki }}
+          ENABLE_RTP2HTTPD: ${{ needs.prepare.outputs.enable_rtp2httpd }}
+          ENABLE_ARGON: ${{ needs.prepare.outputs.enable_argon }}
+          ENABLE_TTYD: ${{ needs.prepare.outputs.enable_ttyd }}
+          ENABLE_SFTP: ${{ needs.prepare.outputs.enable_sftp }}
+          ENABLE_WWAN: ${{ needs.prepare.outputs.enable_wwan }}
+          ENABLE_BBR: ${{ needs.prepare.outputs.enable_bbr }}
         run: |
           set -euo pipefail
 
@@ -1388,6 +1665,47 @@ jobs:
             BOOT_ENV_EMMC="Yuzhii \`bl-mt798x-dhcpd\` (eMMC)"
           fi
 
+          # 動態組裝桌面主題與各版本預載模組說明
+          if [ "$ENABLE_ARGON" = "Y" ]; then
+            THEME_DESC="\`Argon\` 現代化視覺介面"
+          else
+            THEME_DESC="\`Bootstrap\` 官方原生介面"
+          fi
+
+          STD_ITEMS=()
+          [ "$ENABLE_ARGON" = "Y" ] && STD_ITEMS+=("**Argon 視覺主題**（\`luci-theme-argon\`）")
+          [ "$ENABLE_TTYD" = "Y" ] && STD_ITEMS+=("**Web 終端機**（\`luci-app-ttyd\`）")
+          [ "$ENABLE_SFTP" = "Y" ] && STD_ITEMS+=("**SFTP + mDNS**（\`openssh-sftp-server\`）")
+          [ "$ENABLE_WWAN" = "Y" ] && STD_ITEMS+=("**5G/4G 行動寬頻驅動**")
+          [ "$ENABLE_BBR" = "Y" ] && STD_ITEMS+=("**TCP BBR 加速**")
+          if [ "${#STD_ITEMS[@]}" -gt 0 ]; then
+            STD_DESC=$(IFS="、"; echo "${STD_ITEMS[*]}")
+          else
+            STD_DESC="純淨官方 LuCI 基礎系統與核心網路模組"
+          fi
+
+          PRO_ITEMS=()
+          [ "$ENABLE_NIKKI" = "Y" ] && PRO_ITEMS+=("**Nikki 透明代理**（\`luci-app-nikki\`，預置官方最新 \`Alpha-Smart\` 核心）")
+          [ "$ENABLE_RTP2HTTPD" = "Y" ] && PRO_ITEMS+=("**IPTV 串流轉發**（\`luci-app-rtp2httpd\` 原生 C 高效能版）")
+          if [ "${#PRO_ITEMS[@]}" -gt 0 ]; then
+            PRO_EXTRA=$(IFS="、"; echo "${PRO_ITEMS[*]}")
+            PRO_DESC="完整包含 **\`Std\`** 所有功能，額外整合 ${PRO_EXTRA}"
+          else
+            PRO_DESC="完整包含 **\`Std\`** 所有功能（本次建置未啟用額外 Pro 插件）"
+          fi
+
+          CORE_FEATURES=""
+          if [ "$ENABLE_BBR" = "Y" ]; then
+            CORE_FEATURES+="- **TCP BBR 高速擁塞控制**：底層內建並預設啟用 \`kmod-tcp-bbr\` 演算法，顯著提升高頻寬吞吐表現並降低網路延遲。"$'\n'
+          fi
+          if [ "$ENABLE_WWAN" = "Y" ]; then
+            CORE_FEATURES+="- **5G / 4G 行動寬頻即插即用**：原生整合移遠（Quectel）、高通（Qualcomm）等蜂巢式網路模組與智慧型手機 USB 網路共享驅動，完整支援 QMI、MBIM、NCM、RNDIS 與 ECM 撥號協議及 \`picocom\` 終端工具，未接入模組時零記憶體佔用。"$'\n'
+          fi
+          CORE_FEATURES+="- **官方核心模組無縫擴充**：建置期自動依源碼核心版本對齊官方 \`kmods\` 軟體源校驗碼（\`vermagic\`），並預載 \`kmod-netlink-diag\`、\`kmod-inet-diag\`、\`kmod-nft-socket\`、\`kmod-nft-tproxy\` 與 \`kmod-tun\`，安裝各類網路工具免受核心版本相容性限制。"$'\n'
+          if [ "$ENABLE_SFTP" = "Y" ]; then
+            CORE_FEATURES+="- **SFTP 與零配置網路發現**：內建 \`openssh-sftp-server\` 與 \`openssh-sftp-avahi-service\`（mDNS），開機即支援區域網路設備自動發現與加密檔案管理。"$'\n'
+          fi
+
           SHA256_CONTENT=$(cat all_firmwares/sha256sums.txt)
 
           cat > release_notes.md << EOF
@@ -1403,7 +1721,7 @@ jobs:
           | **韌體格式** | 原生 **\`${IMG_FMT_UPPER}\`** 封裝（通過硬體級二進位檔頭校驗） |
           | **管理位址** | \`http://192.168.7.1\`（主機名稱：\`ImmortalWrt\`） |
           | **登入憑證** | 帳號 \`root\`，預設免密碼 |
-          | **桌面主題** | \`Argon\` 現代化視覺介面 |
+          | **桌面主題** | ${THEME_DESC} |
           | **建置時間** | ${BUILD_START_TIME} 開編 · ${FINISH_TIME} 發佈（Build \`#${{ github.run_number }}\`） |
 
           ### 版本陣容
@@ -1412,16 +1730,16 @@ jobs:
 
           | 版本代號 | 版本定位 | 檔名標識 | 預載應用與服務 |
           | :--- | :--- | :--- | :--- |
-          | **\`Std\`** | **Standard 標準基礎版** | \`*-Std.${IMG_FMT}\` | **Argon 視覺主題**（\`luci-theme-argon\`）、**Web 終端機**（\`luci-app-ttyd\`），並完整內建底層網路加速與 5G/4G 行動寬頻驅動 |
-          | **\`Pro\`** | **Professional 專業增強版** | \`*-Pro.${IMG_FMT}\` | 完整包含 **\`Std\`** 所有功能，額外整合 **Nikki 透明代理**（\`luci-app-nikki\`，預置官方最新 \`Alpha-Smart\` 核心）與 **IPTV 串流轉發**（\`luci-app-rtp2httpd\` 原生 C 高效能版） |
+          | **\`Std\`** | **Standard 標準基礎版** | \`*-Std.${IMG_FMT}\` | ${STD_DESC} |
+          | **\`Pro\`** | **Professional 專業增強版** | \`*-Pro.${IMG_FMT}\` | ${PRO_DESC} |
+
+          ### 插件模組整合狀態
+
+          \`Nikki=${ENABLE_NIKKI}\` · \`rtp2httpd=${ENABLE_RTP2HTTPD}\` · \`Argon=${ENABLE_ARGON}\` · \`TTYD=${ENABLE_TTYD}\` · \`SFTP=${ENABLE_SFTP}\` · \`5G/4G=${ENABLE_WWAN}\` · \`BBR=${ENABLE_BBR}\`
 
           ### 核心架構與連線能力
 
-          - **TCP BBR 高速擁塞控制**：底層內建並預設啟用 \`kmod-tcp-bbr\` 演算法，顯著提升高頻寬吞吐表現並降低網路延遲。
-          - **5G / 4G 行動寬頻即插即用**：原生整合移遠（Quectel）、高通（Qualcomm）等蜂巢式網路模組與智慧型手機 USB 網路共享驅動，完整支援 QMI、MBIM、NCM、RNDIS 與 ECM 撥號協議及 \`picocom\` 終端工具，未接入模組時零記憶體佔用。
-          - **官方核心模組無縫擴充**：建置期自動依源碼核心版本對齊官方 \`kmods\` 軟體源校驗碼（\`vermagic\`），並預載 \`kmod-netlink-diag\`、\`kmod-inet-diag\`、\`kmod-nft-socket\`、\`kmod-nft-tproxy\` 與 \`kmod-tun\`，安裝各類網路工具免受核心版本相容性限制。
-          - **SFTP 與零配置網路發現**：內建 \`openssh-sftp-server\` 與 \`openssh-sftp-avahi-service\`（mDNS），開機即支援區域網路設備自動發現與加密檔案管理。
-
+          ${CORE_FEATURES}
           ### 支援機型與硬體規格
 
           | 機型名稱 | 韌體目標代號 | 處理器與儲存配置 | 適配引導環境 |
