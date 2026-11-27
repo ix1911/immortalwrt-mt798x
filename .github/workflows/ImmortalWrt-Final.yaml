@@ -327,6 +327,13 @@ jobs:
       upstream_commit_time: ${{ steps.clone.outputs.upstream_commit_time }}
       upstream_commit_hash: ${{ steps.clone.outputs.upstream_commit_hash }}
       img_version: ${{ steps.compile.outputs.img_version }}
+      built_nikki: ${{ steps.compile.outputs.built_nikki }}
+      built_rtp2httpd: ${{ steps.compile.outputs.built_rtp2httpd }}
+      built_argon: ${{ steps.compile.outputs.built_argon }}
+      built_ttyd: ${{ steps.compile.outputs.built_ttyd }}
+      built_sftp: ${{ steps.compile.outputs.built_sftp }}
+      built_wwan: ${{ steps.compile.outputs.built_wwan }}
+      built_bbr: ${{ steps.compile.outputs.built_bbr }}
     env:
       DEBIAN_FRONTEND: noninteractive
       RESOLVED_VER: ${{ needs.prepare.outputs.resolved_ver }}
@@ -1378,6 +1385,30 @@ jobs:
                 exit 1
               }
             fi
+            if [ "$ENABLE_TTYD" = "Y" ]; then
+              grep -qE '^CONFIG_PACKAGE_luci-app-ttyd=y$' .config || {
+                echo "::error::[TTYD] 已啟用但未成功寫入 .config！"
+                exit 1
+              }
+            fi
+            if [ "$ENABLE_SFTP" = "Y" ]; then
+              grep -qE '^CONFIG_PACKAGE_openssh-sftp-server=y$' .config || {
+                echo "::error::[SFTP] 已啟用但未成功寫入 .config！"
+                exit 1
+              }
+            fi
+            if [ "$ENABLE_WWAN" = "Y" ]; then
+              grep -qE '^CONFIG_PACKAGE_kmod-usb-net=y$' .config || {
+                echo "::error::[5G/4G WWAN] 已啟用但未成功寫入 .config！"
+                exit 1
+              }
+            fi
+            if [ "$ENABLE_BBR" = "Y" ]; then
+              grep -qE '^CONFIG_PACKAGE_kmod-tcp-bbr=y$' .config || {
+                echo "::error::[TCP BBR] 已啟用但未成功寫入 .config！"
+                exit 1
+              }
+            fi
 
             if [ "$edition" = "Pro" ]; then
               if [ "$ENABLE_NIKKI" = "Y" ]; then
@@ -1489,6 +1520,13 @@ jobs:
 
           FIRST_PASS="true"
           IMG_VERSION=""
+          BUILT_NIKKI="no"
+          BUILT_RTP2HTTPD="no"
+          BUILT_ARGON="no"
+          BUILT_TTYD="no"
+          BUILT_SFTP="no"
+          BUILT_WWAN="no"
+          BUILT_BBR="no"
 
           for EDITION in "${VARIANT_ARR[@]}"; do
             PASS_START=$(date +%s)
@@ -1535,6 +1573,19 @@ jobs:
             IMG_VERSION=$(detect_img_version)
             collect_and_verify "$EDITION" "$IMG_VERSION"
 
+            # 記錄本輪實際編譯整合完成的模組狀態 (以實際通過編譯的 .config 與檔案為準)
+            grep -qE '^CONFIG_PACKAGE_luci-theme-argon=y$' .config && BUILT_ARGON="yes"
+            grep -qE '^CONFIG_PACKAGE_luci-app-ttyd=y$' .config && BUILT_TTYD="yes"
+            grep -qE '^CONFIG_PACKAGE_openssh-sftp-server=y$' .config && BUILT_SFTP="yes"
+            grep -qE '^CONFIG_PACKAGE_kmod-usb-net=y$' .config && BUILT_WWAN="yes"
+            grep -qE '^CONFIG_PACKAGE_kmod-tcp-bbr=y$' .config && BUILT_BBR="yes"
+            if [ "$EDITION" = "Pro" ]; then
+              if grep -qE '^CONFIG_PACKAGE_luci-app-nikki=y$' .config && [ -f files/usr/libexec/mihomo ]; then
+                BUILT_NIKKI="yes"
+              fi
+              grep -qE '^CONFIG_PACKAGE_luci-app-rtp2httpd=y$' .config && BUILT_RTP2HTTPD="yes"
+            fi
+
             PASS_END=$(date +%s)
             echo "[完成] ${EDITION} 階段耗時: $(( (PASS_END - PASS_START) / 60 )) 分 $(( (PASS_END - PASS_START) % 60 )) 秒"
             df -hT /
@@ -1563,7 +1614,29 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/collected_firmware/"
           echo "::endgroup::"
 
-          echo "img_version=${IMG_VERSION}" >> "$GITHUB_OUTPUT"
+          {
+            echo "img_version=${IMG_VERSION}"
+            echo "built_nikki=${BUILT_NIKKI}"
+            echo "built_rtp2httpd=${BUILT_RTP2HTTPD}"
+            echo "built_argon=${BUILT_ARGON}"
+            echo "built_ttyd=${BUILT_TTYD}"
+            echo "built_sftp=${BUILT_SFTP}"
+            echo "built_wwan=${BUILT_WWAN}"
+            echo "built_bbr=${BUILT_BBR}"
+          } >> "$GITHUB_OUTPUT"
+
+          fmt_build_state() {
+            local built="$1" switch="$2" is_pro="$3"
+            if [ "$built" = "yes" ]; then
+              echo "✅ 已整合編譯"
+            elif [ "$switch" = "N" ]; then
+              echo "⬜ 未整合編譯（開關設為 N）"
+            elif [ "$is_pro" = "true" ] && [ "$NEED_PRO" != "true" ]; then
+              echo "⬜ 未整合編譯（未建置 Pro 版）"
+            else
+              echo "⬜ 未整合編譯"
+            fi
+          }
 
           {
             echo "### ImmortalWrt 編譯報告"
@@ -1572,16 +1645,16 @@ jobs:
             echo "- **編譯機型**: \`${TARGETS}\`"
             echo "- **編譯規格**: \`${VARIANTS}\`"
             echo ""
-            echo "#### 插件模組整合狀態"
-            echo "| 模組 | 層級 | 開關 |"
-            echo "| :--- | :--- | :---: |"
-            echo "| Nikki + Alpha-Smart | Pro | \`${ENABLE_NIKKI}\` |"
-            echo "| rtp2httpd (原生 C 版) | Pro | \`${ENABLE_RTP2HTTPD}\` |"
-            echo "| Argon 視覺主題 | 基礎 | \`${ENABLE_ARGON}\` |"
-            echo "| TTYD Web 終端機 | 基礎 | \`${ENABLE_TTYD}\` |"
-            echo "| SFTP + Avahi mDNS | 基礎 | \`${ENABLE_SFTP}\` |"
-            echo "| 5G/4G 行動寬頻驅動 | 基礎 | \`${ENABLE_WWAN}\` |"
-            echo "| TCP BBR 擁塞控制 | 系統 | \`${ENABLE_BBR}\` |"
+            echo "#### 插件模組整合與編譯狀態"
+            echo "| 模組 | 層級 | 開關 | 實際編譯狀態 |"
+            echo "| :--- | :--- | :---: | :--- |"
+            echo "| Nikki + Alpha-Smart | Pro | \`${ENABLE_NIKKI}\` | $(fmt_build_state "$BUILT_NIKKI" "$ENABLE_NIKKI" "true") |"
+            echo "| rtp2httpd (原生 C 版) | Pro | \`${ENABLE_RTP2HTTPD}\` | $(fmt_build_state "$BUILT_RTP2HTTPD" "$ENABLE_RTP2HTTPD" "true") |"
+            echo "| Argon 視覺主題 | 基礎 | \`${ENABLE_ARGON}\` | $(fmt_build_state "$BUILT_ARGON" "$ENABLE_ARGON" "false") |"
+            echo "| TTYD Web 終端機 | 基礎 | \`${ENABLE_TTYD}\` | $(fmt_build_state "$BUILT_TTYD" "$ENABLE_TTYD" "false") |"
+            echo "| SFTP + Avahi mDNS | 基礎 | \`${ENABLE_SFTP}\` | $(fmt_build_state "$BUILT_SFTP" "$ENABLE_SFTP" "false") |"
+            echo "| 5G/4G 行動寬頻驅動 | 基礎 | \`${ENABLE_WWAN}\` | $(fmt_build_state "$BUILT_WWAN" "$ENABLE_WWAN" "false") |"
+            echo "| TCP BBR 擁塞控制 | 系統 | \`${ENABLE_BBR}\` | $(fmt_build_state "$BUILT_BBR" "$ENABLE_BBR" "false") |"
             echo ""
             echo "| 韌體檔案 | 檔案大小 |"
             echo "| :--- | ---: |"
@@ -1625,6 +1698,9 @@ jobs:
           UPSTREAM_COMMIT_HASH: ${{ needs.build.outputs.upstream_commit_hash }}
           DETECTED_VER: ${{ needs.build.outputs.img_version || needs.prepare.outputs.resolved_ver }}
           IMG_FMT: ${{ needs.prepare.outputs.img_fmt }}
+          TARGETS: ${{ needs.prepare.outputs.targets }}
+          VARIANTS: ${{ needs.prepare.outputs.variants }}
+          NEED_PRO: ${{ needs.prepare.outputs.need_pro }}
           EXPECTED_COUNT: ${{ needs.prepare.outputs.expected_count }}
           ENABLE_NIKKI: ${{ needs.prepare.outputs.enable_nikki }}
           ENABLE_RTP2HTTPD: ${{ needs.prepare.outputs.enable_rtp2httpd }}
@@ -1633,6 +1709,13 @@ jobs:
           ENABLE_SFTP: ${{ needs.prepare.outputs.enable_sftp }}
           ENABLE_WWAN: ${{ needs.prepare.outputs.enable_wwan }}
           ENABLE_BBR: ${{ needs.prepare.outputs.enable_bbr }}
+          BUILT_NIKKI: ${{ needs.build.outputs.built_nikki }}
+          BUILT_RTP2HTTPD: ${{ needs.build.outputs.built_rtp2httpd }}
+          BUILT_ARGON: ${{ needs.build.outputs.built_argon }}
+          BUILT_TTYD: ${{ needs.build.outputs.built_ttyd }}
+          BUILT_SFTP: ${{ needs.build.outputs.built_sftp }}
+          BUILT_WWAN: ${{ needs.build.outputs.built_wwan }}
+          BUILT_BBR: ${{ needs.build.outputs.built_bbr }}
         run: |
           set -euo pipefail
 
@@ -1665,19 +1748,73 @@ jobs:
             BOOT_ENV_EMMC="Yuzhii \`bl-mt798x-dhcpd\` (eMMC)"
           fi
 
-          # 動態組裝桌面主題與各版本預載模組說明
-          if [ "$ENABLE_ARGON" = "Y" ]; then
+          # 判斷實際建置版本範圍 (Std / Pro / Std + Pro)
+          HAS_STD="false"
+          HAS_PRO="false"
+          case " ${VARIANTS} " in *" Std "*) HAS_STD="true" ;; esac
+          case " ${VARIANTS} " in *" Pro "*) HAS_PRO="true" ;; esac
+
+          if [ "$HAS_STD" = "true" ] && [ "$HAS_PRO" = "true" ]; then
+            BASE_SCOPE_LABEL="Std + Pro"
+          elif [ "$HAS_PRO" = "true" ]; then
+            BASE_SCOPE_LABEL="Pro"
+          else
+            BASE_SCOPE_LABEL="Std"
+          fi
+
+          # 動態組裝桌面主題說明 (以實際編譯結果為準)
+          if [ "$BUILT_ARGON" = "yes" ]; then
             THEME_DESC="\`Argon\` 現代化視覺介面"
           else
             THEME_DESC="\`Bootstrap\` 官方原生介面"
           fi
 
+          # 動態組裝「已整合編譯」與「未整合編譯」完整清單與狀態總表
+          PLUGIN_TABLE_ROWS=""
+          INCLUDED_PLUGINS=""
+          EXCLUDED_PLUGINS=""
+
+          add_plugin_record() {
+            local name="$1" tier="$2" switch_val="$3" built_val="$4" scope_when_built="$5" pkg_detail="$6" off_note="$7"
+            if [ "$built_val" = "yes" ]; then
+              PLUGIN_TABLE_ROWS+="| **${name}** | ${tier} | \`${switch_val}\` | ✅ 已整合編譯（${scope_when_built}） | ${pkg_detail} |"$'\n'
+              INCLUDED_PLUGINS+="- **${name}**（\`${scope_when_built}\`）：${pkg_detail}"$'\n'
+            else
+              local reason=""
+              if [ "$switch_val" = "N" ]; then
+                reason="模組開關設為 \`N\`${off_note:+；${off_note}}"
+              elif [ "$tier" = "Pro 專屬" ] && [ "$HAS_PRO" != "true" ]; then
+                reason="本次僅編譯 \`Std\` 版本，未建置 \`Pro\` 專屬模組"
+              else
+                reason="未參與本次編譯"
+              fi
+              PLUGIN_TABLE_ROWS+="| **${name}** | ${tier} | \`${switch_val}\` | ⬜ 未整合編譯 | ${reason} |"$'\n'
+              EXCLUDED_PLUGINS+="- **${name}**（開關 \`${switch_val}\`）：未整合編譯 — ${reason}"$'\n'
+            fi
+          }
+
+          add_plugin_record "Nikki 透明代理 + Alpha-Smart 核心" "Pro 專屬" "$ENABLE_NIKKI" "$BUILT_NIKKI" "Pro"             "\`nikki\`、\`luci-app-nikki\`、中文語言包及預置官方最新 \`vernesong/mihomo\` Alpha-Smart 核心" ""
+          add_plugin_record "rtp2httpd IPTV 串流轉發" "Pro 專屬" "$ENABLE_RTP2HTTPD" "$BUILT_RTP2HTTPD" "Pro"             "\`rtp2httpd\` 原生 C 高效能版、\`luci-app-rtp2httpd\` 與中文語言包" ""
+          add_plugin_record "Argon 視覺主題" "基礎模組" "$ENABLE_ARGON" "$BUILT_ARGON" "$BASE_SCOPE_LABEL"             "\`luci-theme-argon\` 並設為預設介面主題" "改回使用官方預設 \`Bootstrap\` 主題"
+          add_plugin_record "TTYD Web 網頁終端機" "基礎模組" "$ENABLE_TTYD" "$BUILT_TTYD" "$BASE_SCOPE_LABEL"             "\`luci-app-ttyd\` 與中文語言包" ""
+          add_plugin_record "OpenSSH SFTP + Avahi mDNS" "基礎模組" "$ENABLE_SFTP" "$BUILT_SFTP" "$BASE_SCOPE_LABEL"             "\`openssh-sftp-server\`、\`openssh-sftp-avahi-service\` 與 \`avahi-dbus-daemon\`" ""
+          add_plugin_record "5G / 4G 行動寬頻與 USB 共享驅動" "基礎模組" "$ENABLE_WWAN" "$BUILT_WWAN" "$BASE_SCOPE_LABEL"             "QMI / MBIM / NCM / RNDIS / ECM 蜂巢與手機 USB 共享驅動、\`usb-modeswitch\` 與 \`picocom\`" ""
+          add_plugin_record "TCP BBR 高速擁塞控制" "系統加速" "$ENABLE_BBR" "$BUILT_BBR" "$BASE_SCOPE_LABEL"             "\`kmod-tcp-bbr\` 並寫入 sysctl 預設啟用" ""
+
+          if [ -z "$INCLUDED_PLUGINS" ]; then
+            INCLUDED_PLUGINS="- 無（本次未整合任何可選插件模組，為純淨官方基礎系統）"$'\n'
+          fi
+          if [ -z "$EXCLUDED_PLUGINS" ]; then
+            EXCLUDED_PLUGINS="- 無（本次全部可選插件模組均已整合編譯）"$'\n'
+          fi
+
+          # 動態組裝「版本陣容」(僅列出本次實際建置的版本)
           STD_ITEMS=()
-          [ "$ENABLE_ARGON" = "Y" ] && STD_ITEMS+=("**Argon 視覺主題**（\`luci-theme-argon\`）")
-          [ "$ENABLE_TTYD" = "Y" ] && STD_ITEMS+=("**Web 終端機**（\`luci-app-ttyd\`）")
-          [ "$ENABLE_SFTP" = "Y" ] && STD_ITEMS+=("**SFTP + mDNS**（\`openssh-sftp-server\`）")
-          [ "$ENABLE_WWAN" = "Y" ] && STD_ITEMS+=("**5G/4G 行動寬頻驅動**")
-          [ "$ENABLE_BBR" = "Y" ] && STD_ITEMS+=("**TCP BBR 加速**")
+          [ "$BUILT_ARGON" = "yes" ] && STD_ITEMS+=("**Argon 視覺主題**（\`luci-theme-argon\`）")
+          [ "$BUILT_TTYD" = "yes" ] && STD_ITEMS+=("**Web 終端機**（\`luci-app-ttyd\`）")
+          [ "$BUILT_SFTP" = "yes" ] && STD_ITEMS+=("**SFTP + mDNS**（\`openssh-sftp-server\`）")
+          [ "$BUILT_WWAN" = "yes" ] && STD_ITEMS+=("**5G/4G 行動寬頻驅動**")
+          [ "$BUILT_BBR" = "yes" ] && STD_ITEMS+=("**TCP BBR 加速**")
           if [ "${#STD_ITEMS[@]}" -gt 0 ]; then
             STD_DESC=$(IFS="、"; echo "${STD_ITEMS[*]}")
           else
@@ -1685,26 +1822,64 @@ jobs:
           fi
 
           PRO_ITEMS=()
-          [ "$ENABLE_NIKKI" = "Y" ] && PRO_ITEMS+=("**Nikki 透明代理**（\`luci-app-nikki\`，預置官方最新 \`Alpha-Smart\` 核心）")
-          [ "$ENABLE_RTP2HTTPD" = "Y" ] && PRO_ITEMS+=("**IPTV 串流轉發**（\`luci-app-rtp2httpd\` 原生 C 高效能版）")
+          [ "$BUILT_NIKKI" = "yes" ] && PRO_ITEMS+=("**Nikki 透明代理**（\`luci-app-nikki\`，預置官方最新 \`Alpha-Smart\` 核心）")
+          [ "$BUILT_RTP2HTTPD" = "yes" ] && PRO_ITEMS+=("**IPTV 串流轉發**（\`luci-app-rtp2httpd\` 原生 C 高效能版）")
           if [ "${#PRO_ITEMS[@]}" -gt 0 ]; then
             PRO_EXTRA=$(IFS="、"; echo "${PRO_ITEMS[*]}")
-            PRO_DESC="完整包含 **\`Std\`** 所有功能，額外整合 ${PRO_EXTRA}"
+            if [ "$HAS_STD" = "true" ]; then
+              PRO_DESC="完整包含 **\`Std\`** 所有功能，額外整合 ${PRO_EXTRA}"
+            else
+              PRO_DESC="包含基礎模組（${STD_DESC}），並額外整合 ${PRO_EXTRA}"
+            fi
           else
-            PRO_DESC="完整包含 **\`Std\`** 所有功能（本次建置未啟用額外 Pro 插件）"
+            if [ "$HAS_STD" = "true" ]; then
+              PRO_DESC="完整包含 **\`Std\`** 所有功能（本次未啟用額外 Pro 插件）"
+            else
+              PRO_DESC="包含基礎模組（${STD_DESC}）；本次未啟用額外 Pro 插件"
+            fi
           fi
 
+          VERSION_TABLE_ROWS=""
+          if [ "$HAS_STD" = "true" ] && [ "$HAS_PRO" = "true" ]; then
+            VERSION_INTRO="提供 **Standard（\`Std\`）** 與 **Pro（\`Pro\`）** 兩款版本配置，兼顧純淨穩定與進階網路管理需求："
+            VERSION_TABLE_ROWS+="| **\`Std\`** | **Standard 標準基礎版** | \`*-Std.${IMG_FMT}\` | ${STD_DESC} |"$'\n'
+            VERSION_TABLE_ROWS+="| **\`Pro\`** | **Professional 專業增強版** | \`*-Pro.${IMG_FMT}\` | ${PRO_DESC} |"$'\n'
+          elif [ "$HAS_STD" = "true" ]; then
+            VERSION_INTRO="本次僅建置 **Standard（\`Std\`）** 單一基礎版本："
+            VERSION_TABLE_ROWS+="| **\`Std\`** | **Standard 標準基礎版** | \`*-Std.${IMG_FMT}\` | ${STD_DESC} |"$'\n'
+          else
+            VERSION_INTRO="本次僅建置 **Pro（\`Pro\`）** 單一增強版本："
+            VERSION_TABLE_ROWS+="| **\`Pro\`** | **Professional 專業增強版** | \`*-Pro.${IMG_FMT}\` | ${PRO_DESC} |"$'\n'
+          fi
+
+          # 動態組裝「核心架構與連線能力」(僅列出本次實際編譯整合之能力)
           CORE_FEATURES=""
-          if [ "$ENABLE_BBR" = "Y" ]; then
+          if [ "$BUILT_BBR" = "yes" ]; then
             CORE_FEATURES+="- **TCP BBR 高速擁塞控制**：底層內建並預設啟用 \`kmod-tcp-bbr\` 演算法，顯著提升高頻寬吞吐表現並降低網路延遲。"$'\n'
           fi
-          if [ "$ENABLE_WWAN" = "Y" ]; then
+          if [ "$BUILT_WWAN" = "yes" ]; then
             CORE_FEATURES+="- **5G / 4G 行動寬頻即插即用**：原生整合移遠（Quectel）、高通（Qualcomm）等蜂巢式網路模組與智慧型手機 USB 網路共享驅動，完整支援 QMI、MBIM、NCM、RNDIS 與 ECM 撥號協議及 \`picocom\` 終端工具，未接入模組時零記憶體佔用。"$'\n'
           fi
           CORE_FEATURES+="- **官方核心模組無縫擴充**：建置期自動依源碼核心版本對齊官方 \`kmods\` 軟體源校驗碼（\`vermagic\`），並預載 \`kmod-netlink-diag\`、\`kmod-inet-diag\`、\`kmod-nft-socket\`、\`kmod-nft-tproxy\` 與 \`kmod-tun\`，安裝各類網路工具免受核心版本相容性限制。"$'\n'
-          if [ "$ENABLE_SFTP" = "Y" ]; then
+          if [ "$BUILT_SFTP" = "yes" ]; then
             CORE_FEATURES+="- **SFTP 與零配置網路發現**：內建 \`openssh-sftp-server\` 與 \`openssh-sftp-avahi-service\`（mDNS），開機即支援區域網路設備自動發現與加密檔案管理。"$'\n'
           fi
+
+          # 動態組裝「支援機型與硬體規格」(僅列出本次實際建置的機型)
+          DEVICE_TABLE_ROWS=""
+          for dev in $TARGETS; do
+            case "$dev" in
+              cudy_tr3000-v1)
+                DEVICE_TABLE_ROWS+="| **Cudy TR3000 v1** | \`cudy_tr3000-v1\` | MediaTek MT7981B · 128MB SPI-NAND（112MB 大分區） | ${BOOT_ENV_NAND} |"$'\n'
+                ;;
+              jdcloud_re-cp-03)
+                DEVICE_TABLE_ROWS+="| **京東雲無線寶 AX6000 百里** | \`jdcloud_re-cp-03\` | MediaTek MT7986A · eMMC 高速儲存 | ${BOOT_ENV_EMMC} |"$'\n'
+                ;;
+              cmcc_rax3000m-emmc)
+                DEVICE_TABLE_ROWS+="| **中國移動 RAX3000M 算力版** | \`cmcc_rax3000m-emmc\` | MediaTek MT7981B · eMMC 高速儲存 | ${BOOT_ENV_EMMC} |"$'\n'
+                ;;
+            esac
+          done
 
           SHA256_CONTENT=$(cat all_firmwares/sha256sums.txt)
 
@@ -1726,28 +1901,32 @@ jobs:
 
           ### 版本陣容
 
-          提供 **Standard（\`Std\`）** 與 **Pro（\`Pro\`）** 兩款版本配置，兼顧純淨穩定與進階網路管理需求：
+          ${VERSION_INTRO}
 
           | 版本代號 | 版本定位 | 檔名標識 | 預載應用與服務 |
           | :--- | :--- | :--- | :--- |
-          | **\`Std\`** | **Standard 標準基礎版** | \`*-Std.${IMG_FMT}\` | ${STD_DESC} |
-          | **\`Pro\`** | **Professional 專業增強版** | \`*-Pro.${IMG_FMT}\` | ${PRO_DESC} |
+          ${VERSION_TABLE_ROWS}
+          ### 插件模組整合與編譯清單
 
-          ### 插件模組整合狀態
+          #### 模組狀態總覽
 
-          \`Nikki=${ENABLE_NIKKI}\` · \`rtp2httpd=${ENABLE_RTP2HTTPD}\` · \`Argon=${ENABLE_ARGON}\` · \`TTYD=${ENABLE_TTYD}\` · \`SFTP=${ENABLE_SFTP}\` · \`5G/4G=${ENABLE_WWAN}\` · \`BBR=${ENABLE_BBR}\`
+          | 插件模組 | 歸屬層級 | 開關設定 | 實際編譯狀態 | 說明 / 套件內容 |
+          | :--- | :--- | :---: | :--- | :--- |
+          ${PLUGIN_TABLE_ROWS}
+          #### ✅ 本次已整合編譯
 
+          ${INCLUDED_PLUGINS}
+          #### ⬜ 本次未整合編譯
+
+          ${EXCLUDED_PLUGINS}
           ### 核心架構與連線能力
 
           ${CORE_FEATURES}
-          ### 支援機型與硬體規格
+          ### 本次編譯機型與硬體規格
 
           | 機型名稱 | 韌體目標代號 | 處理器與儲存配置 | 適配引導環境 |
           | :--- | :--- | :--- | :--- |
-          | **Cudy TR3000 v1** | \`cudy_tr3000-v1\` | MediaTek MT7981B · 128MB SPI-NAND（112MB 大分區） | ${BOOT_ENV_NAND} |
-          | **京東雲無線寶 AX6000 百里** | \`jdcloud_re-cp-03\` | MediaTek MT7986A · eMMC 高速儲存 | ${BOOT_ENV_EMMC} |
-          | **中國移動 RAX3000M 算力版** | \`cmcc_rax3000m-emmc\` | MediaTek MT7981B · eMMC 高速儲存 | ${BOOT_ENV_EMMC} |
-
+          ${DEVICE_TABLE_ROWS}
           ### 檔案校驗 (SHA-256)
 
           \`\`\`text
