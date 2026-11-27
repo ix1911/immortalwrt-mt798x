@@ -1,0 +1,2491 @@
+name: ImmortalWrt 模組化極速編譯 (單檔全整合・按平台分組・共享工具鏈)
+
+# =============================================================================
+# 【最頂層模組化設定區】所有常用參數集中於此，簡明直觀、修改即全鏈路生效
+# （說明：定時自動編譯讀取下方 env 預設值；手動 Run workflow 直接顯示並套用下方 inputs 明確選項，修改永久預設時請同步調整對應 default）
+# =============================================================================
+env:
+  # ---------------------------------------------------------------------------
+  # 一、編譯時間（上游巡檢 + 定時編譯）
+  # ---------------------------------------------------------------------------
+  UPSTREAM_CHECK: 'Y'            # 上游新版本巡檢開關：Y = 發現上游更新即自動編譯 / N = 關閉巡檢（巡檢週期由下方 cron 控制，預設每 24 小時）
+  TRACK_PLUGINS: 'N'             # 巡檢範圍：N = 僅追蹤 ImmortalWrt 主線版本（不因 mihomo Alpha 頻繁更新觸發）/ Y = 同步追蹤外部插件更新
+  SCHEDULE_MODE: 'monthly_1'     # 定時編譯頻率（均於台北時間 00:00 執行）：
+                                 #   monthly_1  = 每月 1 日（預設）
+                                 #   weekly_mon = 每週一
+                                 #   monthly_3  = 每月 3 次（1 日、11 日、21 日）
+                                 #   off        = 關閉定時編譯
+
+  # ---------------------------------------------------------------------------
+  # 二、編譯版本（預設最新穩定版，支援穩定版 1/2/3 與開發版 1/2/3）
+  # ---------------------------------------------------------------------------
+  # 可選值：
+  #   release-1 / release-2 / release-3  -> 官方最新第 1 / 2 / 3 個穩定正式版（1 為最新）
+  #   dev-1     / dev-2     / dev-3      -> 官方最新第 1 / 2 / 3 個開發分支版（1 為最新）
+  #   亦支援直接填寫指定 Tag 或分支名（如 v24.10.0、openwrt-24.10）
+  BUILD_VERSION: 'release-1'
+
+  # ---------------------------------------------------------------------------
+  # 三、編譯機型（可自由增減；對照 https://firmware-selector.immortalwrt.org/）
+  # ---------------------------------------------------------------------------
+  # 支援 4 種簡化寫法（每行一台，行首加 # 可暫時停用）：
+  #   1) 完整寫法：target/subtarget|profile_id|顯示名稱|硬體備註
+  #   2) 標準寫法：target/subtarget|profile_id          （如 x86/64|generic 或 qualcommax/ipq807x|xiaomi_ax3600）
+  #   3) 極簡寫法：profile_id                           （預設歸入 mediatek/filogic，如 glinet_gl-mt3600be）
+  #   4) 網址直貼：直接貼上官方 Firmware Selector 機型連結（自動解析 target 與 id）
+  # 說明：同平台自動分組以 Multi-Profile 共用核心編譯；跨平台機型自動啟動多台 Runner 並行！
+  DEVICES: |
+    mediatek/filogic|cudy_tr3000-v1|Cudy TR3000 v1|MediaTek MT7981B · 128MB SPI-NAND（112MB 大分區）
+    mediatek/filogic|jdcloud_re-cp-03|京東雲無線寶 AX6000 百里|MediaTek MT7986A · eMMC 高速儲存
+    mediatek/filogic|cmcc_rax3000m-emmc|中國移動 RAX3000M 算力版|MediaTek MT7981B · eMMC 高速儲存
+    mediatek/filogic|glinet_gl-mt3600be|GL.iNet GL-MT3600BE|MediaTek MT7987A · Wi-Fi 7 (BE3600)
+
+  # ---------------------------------------------------------------------------
+  # 四、編譯格式與規格
+  # ---------------------------------------------------------------------------
+  BUILD_FORMAT: 'bin+itb'        # 映像格式：bin（適配 Yuzhii U-Boot）/ itb（官方 FIT）/ bin+itb（同時並行編譯雙格式）
+  BUILD_EDITION: 'Std+Pro'       # 韌體規格：Std+Pro（增量雙版本）/ Std（僅標準版）/ Pro（僅專業版）
+
+  # ---------------------------------------------------------------------------
+  # 五、編譯插件（Y = 整合編譯 / N = 不整合）
+  # ---------------------------------------------------------------------------
+  # 【標準版 Std 插件模組】（Std 與 Pro 版均會包含）
+  STD_ARGON: 'Y'                 # Argon 視覺主題並設為預設（N = 改回官方 Bootstrap）
+  STD_TTYD: 'Y'                  # TTYD Web 網頁終端機
+  STD_SFTP: 'Y'                  # OpenSSH SFTP 檔案管理 + Avahi mDNS 發現
+  STD_WWAN: 'Y'                  # 5G/4G 行動寬頻模組（QMI/MBIM/NCM/RNDIS/ECM）與手機 USB 共享驅動
+  STD_BBR: 'Y'                   # TCP BBR 高速擁塞控制並預設啟用
+  # 【Pro 版專屬插件模組】（僅於 Pro 版疊加整合）
+  PRO_NIKKI: 'Y'                 # Nikki 透明代理 + 最新 vernesong/mihomo Alpha-Smart 核心
+  PRO_RTP2HTTPD: 'Y'             # rtp2httpd 官方最新原生 C 版 IPTV 串流轉發
+
+  # ---------------------------------------------------------------------------
+  # 六、固件預設（網路、憑證、國家/地區、時區 — 自動寫入開機配置並同步顯示於發佈頁）
+  # ---------------------------------------------------------------------------
+  LAN_IP: '192.168.7.1'          # 預設 LAN 管理 IP（合法 IPv4）
+  HOSTNAME: 'ImmortalWrt'        # 預設路由器主機名稱
+  LOGIN_USER: 'root'             # 預設管理員帳號（改為如 admin 將自動建立完整 LuCI/SSH 權限帳號）
+  LOGIN_PASS: ''                 # 預設登入密碼（留空 '' = 免密碼；填值則 SHA-512 雜湊預置並於發佈頁註明）
+  COUNTRY_CODE: 'TW'             # 國家/地區代碼（預設 TW 台灣；自動套用至無線監管域 country）
+  TIMEZONE: 'Asia/Taipei'        # 系統時區（預設 Asia/Taipei 台灣/台北；自動對映 POSIX 時區如 CST-8）
+
+  # ---------------------------------------------------------------------------
+  # 七、編譯參數（緩存策略與容錯）
+  # ---------------------------------------------------------------------------
+  CACHE_MODE: 'ephemeral'        # 緩存策略（不啟用長期 actions/cache 與 ccache）：
+                                 #   ephemeral = 雙格式並行時僅本次臨時共享工具鏈，結束立即刪除（預設）
+                                 #   none      = 完全不共享工具鏈，各 Runner 獨立直編
+  SKIP_MISSING_DEVICE: 'Y'       # 所選舊版分支尚未收錄某機型時：Y = 警告略過不中斷 / N = 嚴格報錯中止
+
+on:
+  schedule:
+    # 預設每 24 小時（每日台北時間 00:00 = UTC 16:00）執行一次上游巡檢與定時編譯判定
+    # 若需改為每 12 小時或每 6 小時巡檢，改為 '0 */12 * * *' 或 '0 */6 * * *' 即可（定時編譯內建同日防重覆機制）
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '編譯版本 (release-1/2/3=最新第1~3穩定版；dev-1/2/3=最新第1~3開發版)'
+        required: false
+        default: 'release-1'
+        type: choice
+        options:
+          - release-1
+          - release-2
+          - release-3
+          - dev-1
+          - dev-2
+          - dev-3
+      format:
+        description: '編譯格式 (bin+itb 雙格式並行 / bin / itb)'
+        required: false
+        default: 'bin+itb'
+        type: choice
+        options:
+          - bin+itb
+          - bin
+          - itb
+      edition:
+        description: '韌體規格 (Std+Pro 增量雙版 / Std / Pro)'
+        required: false
+        default: 'Std+Pro'
+        type: choice
+        options:
+          - Std+Pro
+          - Std
+          - Pro
+      devices:
+        description: '編譯機型 (all=頂部 env.DEVICES 全部機型；亦可填單一/逗號分隔代號)'
+        required: false
+        default: 'all'
+        type: string
+      std_argon:
+        description: '【Std 插件】Argon 主題 (Y=整合 / N=官方 Bootstrap)'
+        required: false
+        default: 'Y'
+        type: choice
+        options: ['Y', 'N']
+      std_ttyd:
+        description: '【Std 插件】TTYD 網頁終端機 (Y=整合 / N=不整合)'
+        required: false
+        default: 'Y'
+        type: choice
+        options: ['Y', 'N']
+      std_sftp:
+        description: '【Std 插件】OpenSSH SFTP + Avahi mDNS (Y=整合 / N=不整合)'
+        required: false
+        default: 'Y'
+        type: choice
+        options: ['Y', 'N']
+      std_wwan:
+        description: '【Std 插件】5G/4G 行動寬頻與手機 USB 共享驅動 (Y=整合 / N=不整合)'
+        required: false
+        default: 'Y'
+        type: choice
+        options: ['Y', 'N']
+      pro_nikki:
+        description: '【Pro 插件】Nikki 透明代理 + Alpha-Smart 核心 (Y=整合 / N=不整合)'
+        required: false
+        default: 'Y'
+        type: choice
+        options: ['Y', 'N']
+      pro_rtp2httpd:
+        description: '【Pro 插件】rtp2httpd 原生 C 版 IPTV 轉發 (Y=整合 / N=不整合)'
+        required: false
+        default: 'Y'
+        type: choice
+        options: ['Y', 'N']
+
+# 最小權限原則：頂層清空，僅於必要階段授予最小權限
+permissions: {}
+
+# 智慧併發控制：
+# - 定時觸發 (schedule)：歸入 scheduled 組且不中斷進行中的自動發佈
+# - 手動觸發 (workflow_dispatch)：按「版本+格式+規格」隔離，重跑同規格自動取消舊任務，不同規格可並行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'schedule' && 'scheduled' || format('manual-{0}-{1}-{2}', inputs.version || 'release-1', inputs.format || 'bin+itb', inputs.edition || 'Std+Pro') }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ===========================================================================
+  # 階段 1：參數驗證、機型平台分組、上游巡檢與定時編譯判定 (約 10~15 秒)
+  # ===========================================================================
+  prepare:
+    name: 解析設定與排程巡檢 (Prepare & Plan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      should_build: ${{ steps.meta.outputs.should_build }}
+      has_shared_tc: ${{ steps.meta.outputs.has_shared_tc }}
+      source_ref: ${{ steps.meta.outputs.source_ref }}
+      resolved_ver: ${{ steps.meta.outputs.resolved_ver }}
+      tc_matrix_json: ${{ steps.meta.outputs.tc_matrix_json }}
+      build_matrix_json: ${{ steps.meta.outputs.build_matrix_json }}
+      build_config_json: ${{ steps.meta.outputs.build_config_json }}
+      release_meta_json: ${{ steps.meta.outputs.release_meta_json }}
+    steps:
+      - name: 驗證模組參數、分組機型矩陣並執行自動觸發判定
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO_FULL: ${{ github.repository }}
+          # 僅傳遞原始手動輸入（定時觸發時為空字串，自動回退頂層 env 預設值）
+          IN_VERSION: ${{ inputs.version }}
+          IN_FORMAT: ${{ inputs.format }}
+          IN_EDITION: ${{ inputs.edition }}
+          IN_DEVICES: ${{ inputs.devices }}
+          IN_STD_ARGON: ${{ inputs.std_argon }}
+          IN_STD_TTYD: ${{ inputs.std_ttyd }}
+          IN_STD_SFTP: ${{ inputs.std_sftp }}
+          IN_STD_WWAN: ${{ inputs.std_wwan }}
+          IN_PRO_NIKKI: ${{ inputs.pro_nikki }}
+          IN_PRO_RTP2HTTPD: ${{ inputs.pro_rtp2httpd }}
+        run: |
+          set -euo pipefail
+
+          retry() {
+            local max_attempts=$1; shift
+            local attempt=1 rc=0
+            while true; do
+              rc=0; "$@" || rc=$?
+              [ "$rc" -eq 0 ] && return 0
+              [ "$rc" -ge 128 ] && return "$rc"
+              [ "$attempt" -ge "$max_attempts" ] && return "$rc"
+              echo "::warning::指令失敗 (第 ${attempt}/${max_attempts} 次, exit ${rc})，等待重試..."
+              sleep $((attempt * 3))
+              attempt=$((attempt + 1))
+            done
+          }
+
+          norm_yn() {
+            local val="${1:-Y}"
+            case "${val^^}" in
+              Y|YES|TRUE|1) echo "Y" ;;
+              N|NO|FALSE|0) echo "N" ;;
+              *) echo "::error::無效的開關值 '${val}'，僅支援 Y 或 N！" >&2; exit 1 ;;
+            esac
+          }
+
+          # 1. 讀取編譯參數（schedule 讀取頂層 env；手動執行直接套用網頁介面明確選項，未填時回退頂層 env）
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            VER_CHOICE="${BUILD_VERSION:-release-1}"
+            FMT_RAW="${BUILD_FORMAT:-bin+itb}"
+            ED_RAW="${BUILD_EDITION:-Std+Pro}"
+            DEV_FILTER="all"
+            EN_ARGON=$(norm_yn "${STD_ARGON:-Y}")
+            EN_TTYD=$(norm_yn "${STD_TTYD:-Y}")
+            EN_SFTP=$(norm_yn "${STD_SFTP:-Y}")
+            EN_WWAN=$(norm_yn "${STD_WWAN:-Y}")
+            EN_NIKKI=$(norm_yn "${PRO_NIKKI:-Y}")
+            EN_RTP=$(norm_yn "${PRO_RTP2HTTPD:-Y}")
+          else
+            VER_CHOICE="${IN_VERSION:-${BUILD_VERSION:-release-1}}"
+            FMT_RAW="${IN_FORMAT:-${BUILD_FORMAT:-bin+itb}}"
+            ED_RAW="${IN_EDITION:-${BUILD_EDITION:-Std+Pro}}"
+            DEV_FILTER="${IN_DEVICES:-all}"
+            EN_ARGON=$(norm_yn "${IN_STD_ARGON:-${STD_ARGON:-Y}}")
+            EN_TTYD=$(norm_yn "${IN_STD_TTYD:-${STD_TTYD:-Y}}")
+            EN_SFTP=$(norm_yn "${IN_STD_SFTP:-${STD_SFTP:-Y}}")
+            EN_WWAN=$(norm_yn "${IN_STD_WWAN:-${STD_WWAN:-Y}}")
+            EN_NIKKI=$(norm_yn "${IN_PRO_NIKKI:-${PRO_NIKKI:-Y}}")
+            EN_RTP=$(norm_yn "${IN_PRO_RTP2HTTPD:-${PRO_RTP2HTTPD:-Y}}")
+          fi
+
+          EN_BBR=$(norm_yn "${STD_BBR:-Y}")
+          UPSTREAM_CHK=$(norm_yn "${UPSTREAM_CHECK:-Y}")
+          TRACK_PLG=$(norm_yn "${TRACK_PLUGINS:-N}")
+          SKIP_MISSING=$(norm_yn "${SKIP_MISSING_DEVICE:-Y}")
+          SCHED_MODE="${SCHEDULE_MODE:-monthly_1}"
+          CACHE_POLICY="${CACHE_MODE:-ephemeral}"
+
+          TZ_NAME="${TIMEZONE:-Asia/Taipei}"
+          COUNTRY_VAL="${COUNTRY_CODE:-TW}"
+          LAN_IP_VAL="${LAN_IP:-192.168.7.1}"
+          HOST_VAL="${HOSTNAME:-ImmortalWrt}"
+          USER_VAL="${LOGIN_USER:-root}"
+          PASS_VAL="${LOGIN_PASS-}"
+
+          # 2. 驗證全部參數、解析多格式 DEVICES 清單、自動對映時區 POSIX 字串與平台並行矩陣
+          PLAN_JSON=$(python3 - "$LAN_IP_VAL" "$HOST_VAL" "$USER_VAL" "$PASS_VAL" "$COUNTRY_VAL" "$TZ_NAME" "$FMT_RAW" "$ED_RAW" "$DEV_FILTER" "$CACHE_POLICY" << 'PYEOF'
+          import ipaddress
+          import json
+          import os
+          import re
+          import sys
+          import urllib.parse
+
+          lan_ip, host, user, pwd, country, tz_name, fmt_raw, ed_raw, dev_filter, cache_policy = sys.argv[1:11]
+
+          # --- 網路、憑證、國家與時區校驗 ---
+          try:
+              ip_obj = ipaddress.IPv4Address(lan_ip)
+              if ip_obj.is_unspecified or ip_obj.is_multicast or str(ip_obj) == "255.255.255.255":
+                  raise ValueError("保留或無效廣播位址")
+          except Exception as e:
+              print(f"::error::LAN_IP='{lan_ip}' 非合法 IPv4 位址 ({e})！", file=sys.stderr)
+              sys.exit(1)
+
+          if not re.fullmatch(r'[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?', host):
+              print(f"::error::HOSTNAME='{host}' 格式無效！", file=sys.stderr)
+              sys.exit(1)
+
+          if not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', user):
+              print(f"::error::LOGIN_USER='{user}' 格式無效（須小寫字母或底線開頭）！", file=sys.stderr)
+              sys.exit(1)
+
+          if "\n" in pwd or "\r" in pwd:
+              print("::error::LOGIN_PASS 不允許包含換行字元！", file=sys.stderr)
+              sys.exit(1)
+
+          country = country.strip().upper()
+          if not re.fullmatch(r'[A-Z0-9]{2}', country):
+              print(f"::error::COUNTRY_CODE='{country}' 格式無效（應為 2 碼 ISO 國家代碼，如 TW / US / CN / JP / 00）！", file=sys.stderr)
+              sys.exit(1)
+
+          POSIX_MAP = {
+              "Asia/Taipei": "CST-8",
+              "Asia/Shanghai": "CST-8",
+              "Asia/Hong_Kong": "HKT-8",
+              "Asia/Macau": "CST-8",
+              "Asia/Singapore": "<+08>-8",
+              "Asia/Tokyo": "JST-9",
+              "Asia/Seoul": "KST-9",
+              "UTC": "UTC0",
+              "Etc/UTC": "UTC0",
+              "Europe/London": "GMT0BST,M3.5.0/1,M10.5.0",
+              "Europe/Berlin": "CET-1CEST,M3.5.0,M10.5.0/3",
+              "America/Los_Angeles": "PST8PDT,M3.2.0,M11.1.0",
+              "America/New_York": "EST5EDT,M3.2.0,M11.1.0",
+          }
+          tz_name = tz_name.strip()
+          tz_posix = POSIX_MAP.get(tz_name, "")
+          if not tz_posix:
+              # 嘗試自 Linux 系統 tzdata 直接讀取標準 POSIX TZ 字串
+              zfile = os.path.join("/usr/share/zoneinfo", tz_name)
+              if os.path.isfile(zfile):
+                  with open(zfile, "rb") as f:
+                      raw_tz = f.read()
+                  tail = raw_tz.splitlines()[-1].decode("ascii", errors="ignore").strip()
+                  if tail:
+                      tz_posix = tail
+          if not tz_posix:
+              print(f"::error::無法識別 TIMEZONE='{tz_name}'，請使用標準 IANA 時區名（如 Asia/Taipei）！", file=sys.stderr)
+              sys.exit(1)
+
+          COUNTRY_NAMES = {
+              "TW": "台灣 (TW)", "CN": "中國大陸 (CN)", "HK": "香港 (HK)", "MO": "澳門 (MO)",
+              "JP": "日本 (JP)", "US": "美國 (US)", "SG": "新加坡 (SG)", "GB": "英國 (GB)", "00": "全球預設 (00)",
+          }
+          country_label = COUNTRY_NAMES.get(country, country)
+
+          # --- 標準化格式與版本規格 ---
+          fmt_norm = fmt_raw.strip().lower().replace(" ", "")
+          if fmt_norm in ("both", "bin+itb", "itb+bin", "bin,itb", "itb,bin"):
+              img_fmt = "bin+itb"
+          elif fmt_norm in ("bin", "itb"):
+              img_fmt = fmt_norm
+          else:
+              print(f"::error::不支援的編譯格式 '{fmt_raw}'（可選 bin / itb / bin+itb）！", file=sys.stderr)
+              sys.exit(1)
+
+          ed_norm = ed_raw.strip().lower().replace(" ", "")
+          if ed_norm in ("all", "std+pro", "pro+std", "std,pro", "pro,std"):
+              variants, need_pro = "Std Pro", "true"
+          elif ed_norm == "std":
+              variants, need_pro = "Std", "false"
+          elif ed_norm == "pro":
+              variants, need_pro = "Pro", "true"
+          else:
+              print(f"::error::不支援的韌體規格 '{ed_raw}'（可選 Std+Pro / Std / Pro）！", file=sys.stderr)
+              sys.exit(1)
+
+          if cache_policy not in ("ephemeral", "none"):
+              print(f"::error::不支援的 CACHE_MODE='{cache_policy}'（僅支援 ephemeral / none）！", file=sys.stderr)
+              sys.exit(1)
+
+          # --- 多寫法相容機型解析器 (完整 | 簡寫 | 極簡 | Firmware Selector 網址) ---
+          def parse_device(raw_line: str) -> dict:
+              line = raw_line.strip()
+              # 寫法 4：直接貼上 firmware-selector.immortalwrt.org 連結
+              if "target=" in line and "id=" in line:
+                  parsed_url = urllib.parse.urlparse(line if "://" in line else "https://example.invalid/?" + line.lstrip("?"))
+                  qs = urllib.parse.parse_qs(parsed_url.query)
+                  ts = (qs.get("target") or [""])[0].strip()
+                  prof = (qs.get("id") or [""])[0].strip()
+                  name, spec = prof, f"{ts} 官方原生支援機型"
+              else:
+                  parts = [p.strip() for p in line.split("|")]
+                  if len(parts) == 1:
+                      tok = parts[0]
+                      # 支援 mediatek/filogic/glinet_gl-mt3600be 或 mediatek/filogic:glinet_gl-mt3600be
+                      if ":" in tok and "/" in tok.split(":", 1)[0]:
+                          ts, prof = [x.strip() for x in tok.split(":", 1)]
+                      elif tok.count("/") == 2:
+                          t, st, prof = [x.strip() for x in tok.split("/", 2)]
+                          ts = f"{t}/{st}"
+                      else:
+                          ts, prof = "mediatek/filogic", tok
+                      name, spec = prof, f"{ts} 官方原生支援機型"
+                  else:
+                      ts = parts[0]
+                      prof = parts[1]
+                      name = parts[2] if len(parts) >= 3 and parts[2] else prof
+                      spec = parts[3] if len(parts) >= 4 and parts[3] else f"{ts} 官方原生支援機型"
+
+              if "/" not in ts:
+                  raise ValueError(f"無效平台 '{ts}'，應為 target/subtarget（如 mediatek/filogic）")
+              target, subtarget = [x.strip() for x in ts.split("/", 1)]
+              if not re.fullmatch(r'[a-zA-Z0-9_-]+', target) or not re.fullmatch(r'[a-zA-Z0-9_-]+', subtarget):
+                  raise ValueError(f"無效平台字元 '{ts}'")
+              if not re.fullmatch(r'[a-zA-Z0-9._-]+', prof):
+                  raise ValueError(f"無效機型代號 '{prof}'")
+
+              return {
+                  "target": target,
+                  "subtarget": subtarget,
+                  "ts": f"{target}/{subtarget}",
+                  "ts_slug": f"{target}-{subtarget}",
+                  "profile": prof,
+                  "name": name,
+                  "spec": spec,
+              }
+
+          catalog, seen = [], set()
+          for lineno, raw in enumerate(os.environ.get("DEVICES", "").splitlines(), 1):
+              s = raw.strip()
+              if not s or s.startswith("#"):
+                  continue
+              try:
+                  d = parse_device(s)
+              except ValueError as e:
+                  print(f"::error::DEVICES 第 {lineno} 行解析失敗: {e}", file=sys.stderr)
+                  sys.exit(1)
+              k = (d["ts"], d["profile"])
+              if k not in seen:
+                  seen.add(k)
+                  catalog.append(d)
+
+          if not catalog:
+              print("::error::DEVICES 清單為空，請至少配置一個機型！", file=sys.stderr)
+              sys.exit(1)
+
+          tf = (dev_filter or "all").strip()
+          if not tf or tf.lower() == "all":
+              selected = list(catalog)
+          else:
+              selected, sel_keys = [], set()
+              for tok in [t.strip() for t in re.split(r'[,\s]+', tf) if t.strip()]:
+                  hits = [d for d in catalog if d["profile"] == tok or f"{d['ts']}|{d['profile']}" == tok or f"{d['ts']}/{d['profile']}" == tok]
+                  if hits:
+                      for d in hits:
+                          k = (d["ts"], d["profile"])
+                          if k not in sel_keys:
+                              sel_keys.add(k)
+                              selected.append(d)
+                  else:
+                      try:
+                          ad_hoc = parse_device(tok)
+                      except ValueError as e:
+                          print(f"::error::手動機型參數 '{tok}' 格式無效: {e}", file=sys.stderr)
+                          sys.exit(1)
+                      k = (ad_hoc["ts"], ad_hoc["profile"])
+                      if k not in sel_keys:
+                          sel_keys.add(k)
+                          selected.append(ad_hoc)
+
+          # --- 按平台分組並智慧規劃共享工具鏈與並行矩陣 ---
+          groups, group_order = {}, []
+          for d in selected:
+              groups.setdefault(d["ts"], []).append(d)
+              if d["ts"] not in group_order:
+                  group_order.append(d["ts"])
+
+          dual_mode_profiles = {"cudy_tr3000-v1", "jdcloud_re-cp-03", "cmcc_rax3000m-emmc"}
+          tc_matrix, build_matrix = [], []
+
+          for ts in group_order:
+              devs = groups[ts]
+              t0 = devs[0]
+              prof_str = " ".join(d["profile"] for d in devs)
+              has_dual_dev = (ts == "mediatek/filogic") and any(d["profile"] in dual_mode_profiles for d in devs)
+
+              # 僅當選擇 bin+itb 且該平台確實含雙格式特調機型時才拆分 bin + itb 雙 Runner 並行，避免空跑與重複檔名
+              if img_fmt == "bin+itb" and has_dual_dev:
+                  fmts = ["bin", "itb"]
+              elif img_fmt == "bin+itb":
+                  fmts = ["bin"]
+              else:
+                  fmts = [img_fmt]
+
+              use_shared_tc = (cache_policy == "ephemeral") and (len(fmts) > 1)
+              if use_shared_tc:
+                  tc_matrix.append({
+                      "target": t0["target"],
+                      "subtarget": t0["subtarget"],
+                      "ts": ts,
+                      "ts_slug": t0["ts_slug"],
+                  })
+              for fmt in fmts:
+                  build_matrix.append({
+                      "target": t0["target"],
+                      "subtarget": t0["subtarget"],
+                      "ts": ts,
+                      "ts_slug": t0["ts_slug"],
+                      "img_fmt": fmt,
+                      "profiles": prof_str,
+                      "use_shared_tc": "true" if use_shared_tc else "false",
+                  })
+
+          profile_sig = ",".join(f"{d['ts']}:{d['profile']}" for d in selected)
+          print(json.dumps({
+              "country": country,
+              "country_label": country_label,
+              "tz_name": tz_name,
+              "tz_posix": tz_posix,
+              "img_fmt": img_fmt,
+              "variants": variants,
+              "need_pro": need_pro,
+              "devices": selected,
+              "tc_matrix": tc_matrix,
+              "has_shared_tc": "true" if tc_matrix else "false",
+              "build_matrix": build_matrix,
+              "profile_sig": profile_sig,
+          }, ensure_ascii=False))
+          PYEOF
+          )
+
+          COUNTRY_VAL=$(printf '%s' "$PLAN_JSON" | jq -r '.country')
+          COUNTRY_LABEL=$(printf '%s' "$PLAN_JSON" | jq -r '.country_label')
+          TZ_NAME=$(printf '%s' "$PLAN_JSON" | jq -r '.tz_name')
+          TZ_POSIX=$(printf '%s' "$PLAN_JSON" | jq -r '.tz_posix')
+          IMG_FMT=$(printf '%s' "$PLAN_JSON" | jq -r '.img_fmt')
+          VARIANTS=$(printf '%s' "$PLAN_JSON" | jq -r '.variants')
+          NEED_PRO=$(printf '%s' "$PLAN_JSON" | jq -r '.need_pro')
+          DEVICES_JSON=$(printf '%s' "$PLAN_JSON" | jq -c '.devices')
+          TC_MATRIX_JSON=$(printf '%s' "$PLAN_JSON" | jq -c '.tc_matrix')
+          HAS_SHARED_TC=$(printf '%s' "$PLAN_JSON" | jq -r '.has_shared_tc')
+          BUILD_MATRIX_JSON=$(printf '%s' "$PLAN_JSON" | jq -c '.build_matrix')
+          PROFILE_SIG=$(printf '%s' "$PLAN_JSON" | jq -r '.profile_sig')
+
+          BUILD_START_TIME=$(TZ="$TZ_NAME" date "+%Y年%m月%d日 %H時%M分")
+          LOCAL_DATE=$(TZ="$TZ_NAME" date "+%Y-%m-%d")
+          LOCAL_DAY=$(TZ="$TZ_NAME" date "+%d")
+          LOCAL_DOW=$(TZ="$TZ_NAME" date "+%u")  # 1=週一 .. 7=週日
+
+          # 3. 解析編譯版本：支援 release-1/2/3（最新前 3 穩定版）與 dev-1/2/3（最新前 3 開發版）
+          SOURCE_REF=""
+          RESOLVED_VER=""
+          IMM_COMMIT=""
+
+          case "$VER_CHOICE" in
+            release-1|release-2|release-3|latest-release-1|latest-release-2|latest-release-3)
+              RANK="${VER_CHOICE##*-}"
+              REMOTE_TAGS=$(retry 3 git ls-remote --tags --sort=-v:refname \
+                https://github.com/immortalwrt/immortalwrt.git 'refs/tags/v[0-9]*')
+              TOP3_TAGS=$(printf '%s\n' "$REMOTE_TAGS" \
+                | awk -F'refs/tags/' '!/\^\{\}$/ && $2 ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ { if (c < 3) { print $2; c++ } }')
+              [ -n "$TOP3_TAGS" ] || { echo "::error::無法查詢 ImmortalWrt 穩定正式版 Tag！"; exit 1; }
+              echo "官方最新前 3 個穩定正式版："
+              printf '%s\n' "$TOP3_TAGS" | nl -w2 -s'. '
+
+              SOURCE_REF=$(printf '%s\n' "$TOP3_TAGS" | sed -n "${RANK}p")
+              [ -n "$SOURCE_REF" ] || SOURCE_REF=$(printf '%s\n' "$TOP3_TAGS" | sed -n '1p')
+              RESOLVED_VER="${SOURCE_REF#v}"
+              IMM_COMMIT=$(printf '%s\n' "$REMOTE_TAGS" | awk -v ref="refs/tags/${SOURCE_REF}" '
+                $2 == ref "^{}" { deref=$1 }
+                $2 == ref       { direct=$1 }
+                END { print (deref != "" ? deref : direct) }
+              ')
+              ;;
+            dev-1|dev-2|dev-3|latest-snapshot)
+              RANK="1"
+              [[ "$VER_CHOICE" == dev-* ]] && RANK="${VER_CHOICE##*-}"
+              REMOTE_HEADS=$(retry 3 git ls-remote --heads --sort=-v:refname \
+                https://github.com/immortalwrt/immortalwrt.git 'refs/heads/openwrt-[0-9]*')
+              TOP3_DEVS=$(printf '%s\n' "$REMOTE_HEADS" \
+                | awk -F'refs/heads/' '$2 ~ /^openwrt-[0-9]+\.[0-9]+$/ { if (c < 3) { print $2; c++ } }')
+              [ -n "$TOP3_DEVS" ] || TOP3_DEVS="openwrt-25.12"
+              echo "官方最新前 3 個開發快照分支："
+              printf '%s\n' "$TOP3_DEVS" | nl -w2 -s'. '
+
+              SOURCE_REF=$(printf '%s\n' "$TOP3_DEVS" | sed -n "${RANK}p")
+              [ -n "$SOURCE_REF" ] || SOURCE_REF=$(printf '%s\n' "$TOP3_DEVS" | sed -n '1p')
+              RESOLVED_VER="${SOURCE_REF#openwrt-}-SNAPSHOT"
+              IMM_COMMIT=$(printf '%s\n' "$REMOTE_HEADS" | awk -v ref="refs/heads/${SOURCE_REF}" '$2 == ref { print $1; exit }')
+              ;;
+            *)
+              SOURCE_REF="$VER_CHOICE"
+              RESOLVED_VER="${VER_CHOICE#v}"
+              IMM_COMMIT=$(retry 3 git ls-remote https://github.com/immortalwrt/immortalwrt.git "$SOURCE_REF" "refs/tags/${SOURCE_REF}^{}" \
+                | awk 'END{print $1}' || true)
+              ;;
+          esac
+
+          IMM_SHORT="${IMM_COMMIT:0:12}"
+          [ -n "$IMM_SHORT" ] || IMM_SHORT="unknown"
+
+          NEED_NIKKI="false"
+          NEED_RTP="false"
+          HAS_PRO_PLUGINS="false"
+          if [ "$NEED_PRO" = "true" ]; then
+            [ "$EN_NIKKI" = "Y" ] && NEED_NIKKI="true"
+            [ "$EN_RTP" = "Y" ] && NEED_RTP="true"
+            if [ "$NEED_NIKKI" = "true" ] || [ "$NEED_RTP" = "true" ]; then
+              HAS_PRO_PLUGINS="true"
+            fi
+          fi
+
+          # 4. 計算上游指紋（預設 TRACK_PLUGINS=N，僅監測 ImmortalWrt 主線，不因 mihomo 頻繁更新觸發）
+          mkdir -p /tmp/upstream_probe
+          TRACK_SCOPE="${VER_CHOICE}|${IMG_FMT}|${PROFILE_SIG}|${VARIANTS}"
+          UPSTREAM_FP="scope=${TRACK_SCOPE};ref=${SOURCE_REF};imm=${IMM_SHORT}"
+
+          if [ "$TRACK_PLG" = "Y" ]; then
+            NIKKI_SHA="disabled"; MIHOMO_VER="disabled"; RTP_SHA="disabled"
+            if [ "$NEED_NIKKI" = "true" ]; then
+              (git ls-remote https://github.com/nikkinikki-org/OpenWrt-nikki.git refs/heads/main 2>/dev/null | awk 'NR==1{print substr($1,1,12)}' > /tmp/upstream_probe/nikki || true) &
+              PID_N=$!
+              (curl -fsSL --retry 2 --connect-timeout 8 https://github.com/vernesong/mihomo/releases/download/Prerelease-Alpha/version.txt 2>/dev/null | tr -d '[:space:]' > /tmp/upstream_probe/mihomo || true) &
+              PID_M=$!
+            fi
+            if [ "$NEED_RTP" = "true" ]; then
+              (git ls-remote https://github.com/stackia/rtp2httpd.git HEAD 2>/dev/null | awk 'NR==1{print substr($1,1,12)}' > /tmp/upstream_probe/rtp || true) &
+              PID_R=$!
+            fi
+            [ "$NEED_NIKKI" = "true" ] && { wait "$PID_N" || true; wait "$PID_M" || true; }
+            [ "$NEED_RTP" = "true" ] && { wait "$PID_R" || true; }
+            if [ "$NEED_NIKKI" = "true" ]; then
+              NIKKI_SHA=$(cat /tmp/upstream_probe/nikki 2>/dev/null | tr -d '[:space:]' || true); [ -n "$NIKKI_SHA" ] || NIKKI_SHA="unknown"
+              MIHOMO_VER=$(cat /tmp/upstream_probe/mihomo 2>/dev/null | tr -d '[:space:]' || true); [ -n "$MIHOMO_VER" ] || MIHOMO_VER="unknown"
+            fi
+            if [ "$NEED_RTP" = "true" ]; then
+              RTP_SHA=$(cat /tmp/upstream_probe/rtp 2>/dev/null | tr -d '[:space:]' || true); [ -n "$RTP_SHA" ] || RTP_SHA="unknown"
+            fi
+            UPSTREAM_FP="${UPSTREAM_FP};nikki=${NIKKI_SHA};rtp=${RTP_SHA};mihomo=${MIHOMO_VER}"
+          fi
+
+          # 5. 比對歷史 Release 指紋 + 定時編譯規則（monthly_1 / weekly_mon / monthly_3 / off + 同日去重）
+          RELEASES_JSON_FILE="/tmp/upstream_probe/releases.json"
+          curl -fsSL --retry 2 --connect-timeout 10 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${REPO_FULL}/releases?per_page=30" \
+            -o "$RELEASES_JSON_FILE" 2>/dev/null || echo '[]' > "$RELEASES_JSON_FILE"
+
+          DECISION_JSON=$(python3 - "$EVENT_NAME" "$UPSTREAM_CHK" "$SCHED_MODE" "$LOCAL_DATE" "$LOCAL_DAY" "$LOCAL_DOW" "$TRACK_SCOPE" "$UPSTREAM_FP" "$RELEASES_JSON_FILE" << 'PYEOF'
+          import json
+          import re
+          import sys
+
+          event_name, up_chk, sched_mode, local_date, local_day, local_dow, scope, cur_fp, rel_path = sys.argv[1:10]
+          sched_mode = sched_mode.strip().lower()
+          if sched_mode not in ("monthly_1", "weekly_mon", "monthly_3", "off"):
+              print(f"::error::無效的 SCHEDULE_MODE='{sched_mode}'（可選 monthly_1 / weekly_mon / monthly_3 / off）！", file=sys.stderr)
+              sys.exit(1)
+
+          def parse_fp(fp: str) -> dict:
+              return {k.strip(): v.strip() for item in fp.split(";") if "=" in item for k, v in [item.split("=", 1)]}
+
+          last_fp, last_tag, already_sched_today = "", "", False
+          try:
+              releases = json.load(open(rel_path, "r", encoding="utf-8"))
+              if isinstance(releases, list):
+                  for rel in releases:
+                      if rel.get("draft"):
+                          continue
+                      body = rel.get("body") or ""
+                      m_fp = re.search(r'<!--\s*UPSTREAM_FINGERPRINT:([^\n>]+?)\s*-->', body)
+                      if not m_fp:
+                          continue
+                      fp_c = m_fp.group(1).strip()
+                      if parse_fp(fp_c).get("scope") != scope:
+                          continue
+                      if not last_fp:
+                          last_fp = fp_c
+                          last_tag = rel.get("tag_name") or ""
+                      m_day = re.search(r'<!--\s*SCHED_BUILD_DAY:([0-9-]+)\s*-->', body)
+                      if m_day and m_day.group(1).strip() == local_date:
+                          already_sched_today = True
+          except Exception:
+              pass
+
+          cur_map = parse_fp(cur_fp)
+          last_map = parse_fp(last_fp) if last_fp else {}
+          labels = {
+              "ref": "ImmortalWrt 版本/分支",
+              "imm": "ImmortalWrt 主線提交",
+              "nikki": "Nikki 插件上游",
+              "rtp": "rtp2httpd 插件上游",
+              "mihomo": "mihomo Alpha-Smart 核心",
+          }
+          diffs = [
+              f"{labels[k]} ({last_map.get(k, '無')} -> {cur_map.get(k, '無')})"
+              for k in ("ref", "imm", "nikki", "rtp", "mihomo")
+              if last_map and k in cur_map and cur_map.get(k) != last_map.get(k)
+          ]
+
+          is_sched_hit = False
+          sched_desc = ""
+          if sched_mode == "monthly_1" and local_day == "01":
+              is_sched_hit, sched_desc = True, f"每月 1 日定時編譯 ({local_date})"
+          elif sched_mode == "weekly_mon" and local_dow == "1":
+              is_sched_hit, sched_desc = True, f"每週一定時編譯 ({local_date})"
+          elif sched_mode == "monthly_3" and local_day in ("01", "11", "21"):
+              is_sched_hit, sched_desc = True, f"每月 3 次定時編譯（{local_day} 日 · {local_date}）"
+
+          sched_marker = ""
+          if event_name == "schedule":
+              if is_sched_hit and not already_sched_today:
+                  extra = ("；同步偵測到更新：" + "、".join(diffs)) if diffs else "（例行同步最新插件、核心與安全更新）"
+                  res = {"should_build": "true", "trigger": "定時編譯 (schedule)", "reason": f"{sched_desc}{extra}", "sched_marker": local_date}
+              elif up_chk == "Y":
+                  if not last_fp:
+                      res = {"should_build": "true", "trigger": "上游巡檢 (schedule)", "reason": "首次建立此規格組合之自動編譯基準版本", "sched_marker": ""}
+                  elif cur_fp != last_fp:
+                      res = {"should_build": "true", "trigger": "上游巡檢 (schedule)", "reason": "偵測到上游發佈更新：" + "；".join(diffs or ["指紋已更新"]), "sched_marker": ""}
+                  else:
+                      note = "今日定時編譯已完成且" if (is_sched_hit and already_sched_today) else ""
+                      res = {"should_build": "false", "trigger": "上游巡檢 (schedule)", "reason": f"{note}上游無變動（與前次發佈 {last_tag} 一致，已略過）", "sched_marker": ""}
+              else:
+                  res = {"should_build": "false", "trigger": "排程檢查 (schedule)", "reason": f"未達定時編譯日（SCHEDULE_MODE={sched_mode}）且已關閉上游巡檢", "sched_marker": ""}
+          else:
+              if diffs:
+                  reason = "手動觸發編譯（同步偵測到變動：" + "；".join(diffs) + "）"
+              elif last_tag:
+                  reason = f"手動觸發編譯（上游與前次發佈 {last_tag} 一致）"
+              else:
+                  reason = "手動觸發編譯"
+              res = {"should_build": "true", "trigger": "手動觸發 (workflow_dispatch)", "reason": reason, "sched_marker": ""}
+
+          print(json.dumps(res, ensure_ascii=False))
+          PYEOF
+          )
+
+          SHOULD_BUILD=$(printf '%s' "$DECISION_JSON" | jq -r '.should_build')
+          TRIGGER_LABEL=$(printf '%s' "$DECISION_JSON" | jq -r '.trigger')
+          CHANGE_REASON=$(printf '%s' "$DECISION_JSON" | jq -r '.reason')
+          SCHED_MARKER=$(printf '%s' "$DECISION_JSON" | jq -r '.sched_marker')
+
+          BUILD_CONFIG_JSON=$(jq -cn \
+            --arg source_ref "$SOURCE_REF" \
+            --arg resolved_ver "$RESOLVED_VER" \
+            --arg img_fmt_mode "$IMG_FMT" \
+            --arg variants "$VARIANTS" \
+            --arg lan_ip "$LAN_IP_VAL" \
+            --arg hostname "$HOST_VAL" \
+            --arg login_user "$USER_VAL" \
+            --arg login_pass "$PASS_VAL" \
+            --arg country_code "$COUNTRY_VAL" \
+            --arg country_label "$COUNTRY_LABEL" \
+            --arg tz_name "$TZ_NAME" \
+            --arg tz_posix "$TZ_POSIX" \
+            --arg need_pro "$NEED_PRO" \
+            --arg need_nikki "$NEED_NIKKI" \
+            --arg need_rtp "$NEED_RTP" \
+            --arg has_pro_plugins "$HAS_PRO_PLUGINS" \
+            --arg en_nikki "$EN_NIKKI" \
+            --arg en_rtp "$EN_RTP" \
+            --arg en_argon "$EN_ARGON" \
+            --arg en_ttyd "$EN_TTYD" \
+            --arg en_sftp "$EN_SFTP" \
+            --arg en_wwan "$EN_WWAN" \
+            --arg en_bbr "$EN_BBR" \
+            --arg skip_missing "$SKIP_MISSING" \
+            --arg build_start_time "$BUILD_START_TIME" \
+            '{
+              source_ref: $source_ref, resolved_ver: $resolved_ver, img_fmt_mode: $img_fmt_mode,
+              variants: $variants, lan_ip: $lan_ip, hostname: $hostname,
+              login_user: $login_user, login_pass: $login_pass,
+              country_code: $country_code, country_label: $country_label,
+              tz_name: $tz_name, tz_posix: $tz_posix,
+              need_pro: $need_pro, need_nikki: $need_nikki, need_rtp2httpd: $need_rtp,
+              has_pro_plugins: $has_pro_plugins,
+              enable_nikki: $en_nikki, enable_rtp2httpd: $en_rtp, enable_argon: $en_argon,
+              enable_ttyd: $en_ttyd, enable_sftp: $en_sftp, enable_wwan: $en_wwan, enable_bbr: $en_bbr,
+              skip_unsupported: $skip_missing, build_start_time: $build_start_time
+            }')
+
+          RELEASE_META_JSON=$(jq -cn \
+            --arg trigger_label "$TRIGGER_LABEL" \
+            --arg change_reason "$CHANGE_REASON" \
+            --arg upstream_fingerprint "$UPSTREAM_FP" \
+            --arg sched_marker "$SCHED_MARKER" \
+            --argjson devices "$DEVICES_JSON" \
+            '{
+              trigger_label: $trigger_label,
+              change_reason: $change_reason,
+              upstream_fingerprint: $upstream_fingerprint,
+              sched_marker: $sched_marker,
+              devices: $devices
+            }')
+
+          echo "================================================================="
+          echo "排程判定 : ${SHOULD_BUILD} | ${TRIGGER_LABEL} | ${CHANGE_REASON}"
+          echo "目標版本 : ${RESOLVED_VER} (${SOURCE_REF} @ ${IMM_SHORT})"
+          echo "固件預設 : ${LAN_IP_VAL} | ${HOST_VAL} | ${USER_VAL} | ${COUNTRY_LABEL} | ${TZ_NAME} (${TZ_POSIX})"
+          echo "共享工具鏈: ${HAS_SHARED_TC} (CACHE_MODE=${CACHE_POLICY}) | 並行矩陣: ${BUILD_MATRIX_JSON}"
+          echo "================================================================="
+
+          if [ "$SHOULD_BUILD" != "true" ]; then
+            {
+              echo "### ⏭️ 排程巡檢完成 — 本次跳過編譯"
+              echo "- **觸發來源**: ${TRIGGER_LABEL}"
+              echo "- **判定結果**: ${CHANGE_REASON}"
+              echo "- **目標版本**: \`${RESOLVED_VER}\` (\`${SOURCE_REF}\` @ \`${IMM_SHORT}\`)"
+              echo "- **配置機型**: \`${PROFILE_SIG}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            echo "should_build=${SHOULD_BUILD}"
+            echo "has_shared_tc=${HAS_SHARED_TC}"
+            echo "source_ref=${SOURCE_REF}"
+            echo "resolved_ver=${RESOLVED_VER}"
+            echo "tc_matrix_json=${TC_MATRIX_JSON}"
+            echo "build_matrix_json=${BUILD_MATRIX_JSON}"
+            echo "build_config_json=${BUILD_CONFIG_JSON}"
+            echo "release_meta_json=${RELEASE_META_JSON}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ===========================================================================
+  # 階段 2：按需啟動之單次臨時共享工具鏈（僅雙格式並行且 CACHE_MODE=ephemeral 時啟用）
+  # ===========================================================================
+  toolchain:
+    name: 共享工具鏈 (${{ matrix.ts }}・${{ needs.prepare.outputs.resolved_ver }})
+    needs: prepare
+    if: ${{ needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.has_shared_tc == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.tc_matrix_json) }}
+    permissions:
+      contents: read
+      actions: read
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
+      TARGET_NAME: ${{ matrix.target }}
+      SUBTARGET_NAME: ${{ matrix.subtarget }}
+      TS_SLUG: ${{ matrix.ts_slug }}
+    steps:
+      - name: 併發初始化環境並拉取 ImmortalWrt 源碼 (Parallel Init & Clone)
+        run: |
+          set -euo pipefail
+          CANCELLED=0
+          ACTIVE_PID=""
+          kill_tree() {
+            local p="$1" sig="${2:-TERM}" c
+            for c in $(pgrep -P "$p" 2>/dev/null || true); do
+              kill_tree "$c" "$sig"
+            done
+            kill "-${sig}" "$p" 2>/dev/null || true
+          }
+          on_cancel() {
+            CANCELLED=1
+            trap - INT TERM
+            echo "::warning::收到取消信號，正在立即終止所有子進程..."
+            [ -n "$ACTIVE_PID" ] && kill_tree "$ACTIVE_PID" TERM
+            for c in $(pgrep -P $$ 2>/dev/null || true); do kill_tree "$c" TERM; done
+            sleep 1
+            [ -n "$ACTIVE_PID" ] && kill_tree "$ACTIVE_PID" KILL
+            for c in $(pgrep -P $$ 2>/dev/null || true); do kill_tree "$c" KILL; done
+            exit 130
+          }
+          trap on_cancel INT TERM
+          run_interruptible() {
+            local rc=0
+            "$@" &
+            ACTIVE_PID=$!
+            wait "$ACTIVE_PID" || rc=$?
+            ACTIVE_PID=""
+            return "$rc"
+          }
+          mkdir -p /tmp/init_logs
+          (
+            printf '%s\n' /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+              /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/swift \
+              /usr/share/miniconda /usr/local/graalvm /usr/local/.ghcup \
+              /usr/local/share/powershell /usr/local/share/chromium /usr/local/lib/node_modules /opt/az \
+              | xargs -P "$(nproc)" sudo rm -rf
+          ) >/tmp/init_logs/clean.log 2>&1 &
+          PID_CLEAN=$!
+
+          (
+            for attempt in 1 2 3; do
+              rm -rf openwrt
+              if git clone --depth 1 --single-branch -b "$SOURCE_REF" https://github.com/immortalwrt/immortalwrt.git openwrt; then
+                exit 0
+              fi
+              [ "$attempt" -eq 3 ] && exit 1
+              sleep $((attempt * 5))
+            done
+          ) >/tmp/init_logs/clone.log 2>&1 &
+          PID_CLONE=$!
+
+          sudo rm -rf /var/lib/man-db/auto-update
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq -o Dpkg::Use-Pty=0 install -y --no-install-recommends \
+            ack autoconf automake autopoint binutils bison build-essential bzip2 \
+            ca-certificates cmake cpio curl device-tree-compiler file flex \
+            g++ g++-multilib gawk gcc gcc-multilib genisoimage gettext git gperf \
+            intltool jq lib32gcc-s1 libc6-dev-i386 libdw-dev libelf-dev libfuse-dev \
+            libglib2.0-dev libgmp-dev libltdl-dev libmbedtls-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libzstd-dev ninja-build openssl patch pkgconf python3 python3-pip \
+            python3-ply python3-pyelftools python3-setuptools re2c rsync \
+            squashfs-tools swig texinfo time u-boot-tools unzip wget xsltproc \
+            xxd xz-utils zlib1g-dev zstd
+          sudo -E apt-get -qq clean
+
+          wait "$PID_CLEAN" || true
+          wait "$PID_CLONE" || { cat /tmp/init_logs/clone.log; echo "::error::拉取 ImmortalWrt 源碼失敗！"; exit 1; }
+
+      - name: 編譯 Host Tools 與 Cross-Toolchain 並以多執行緒 Zstd 封裝 (Build & Pack)
+        working-directory: ./openwrt
+        run: |
+          set -euo pipefail
+          CANCELLED=0
+          ACTIVE_PID=""
+          kill_tree() {
+            local p="$1" sig="${2:-TERM}" c
+            for c in $(pgrep -P "$p" 2>/dev/null || true); do
+              kill_tree "$c" "$sig"
+            done
+            kill "-${sig}" "$p" 2>/dev/null || true
+          }
+          on_cancel() {
+            CANCELLED=1
+            trap - INT TERM
+            echo "::warning::收到取消信號，正在立即終止所有子進程..."
+            [ -n "$ACTIVE_PID" ] && kill_tree "$ACTIVE_PID" TERM
+            for c in $(pgrep -P $$ 2>/dev/null || true); do kill_tree "$c" TERM; done
+            sleep 1
+            [ -n "$ACTIVE_PID" ] && kill_tree "$ACTIVE_PID" KILL
+            for c in $(pgrep -P $$ 2>/dev/null || true); do kill_tree "$c" KILL; done
+            exit 130
+          }
+          trap on_cancel INT TERM
+          run_interruptible() {
+            local rc=0
+            "$@" &
+            ACTIVE_PID=$!
+            wait "$ACTIVE_PID" || rc=$?
+            ACTIVE_PID=""
+            return "$rc"
+          }
+          BUILD_JOBS=$(( $(nproc) + 1 ))
+          DL_JOBS=$(( $(nproc) * 2 ))
+
+          run_make_safe() {
+            local j1="$1" j2="$2" j3="$3"; shift 3
+            local rc=0
+            run_interruptible make "$@" -j"${j1}" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              [ "$CANCELLED" -eq 1 ] || [ "$rc" -ge 128 ] && exit "$rc"
+              rc=0; run_interruptible make "$@" -j"${j2}" || rc=$?
+              if [ "$rc" -ne 0 ]; then
+                [ "$CANCELLED" -eq 1 ] || [ "$rc" -ge 128 ] && exit "$rc"
+                run_interruptible make "$@" -j"${j3}" V=s
+              fi
+            fi
+          }
+
+          cat > .config << EOF
+          CONFIG_TARGET_${TARGET_NAME}=y
+          CONFIG_TARGET_${TARGET_NAME}_${SUBTARGET_NAME}=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          # CONFIG_TARGET_ROOTFS_EXT4FS is not set
+          # CONFIG_TARGET_ROOTFS_TARGZ is not set
+          # CONFIG_TARGET_ROOTFS_CPIOGZ is not set
+          CONFIG_DEVEL=y
+          # CONFIG_CCACHE is not set
+          # CONFIG_SDK is not set
+          # CONFIG_IB is not set
+          # CONFIG_MAKE_TOOLCHAIN is not set
+          EOF
+          make defconfig
+
+          run_make_safe "${DL_JOBS}" "$(nproc)" 4 tools/download
+          run_make_safe "${DL_JOBS}" "$(nproc)" 4 toolchain/download
+          run_make_safe "${BUILD_JOBS}" "$(nproc)" 1 tools/install
+          run_make_safe "${BUILD_JOBS}" "$(nproc)" 1 toolchain/install
+
+          TC_GCC=$(find staging_dir/toolchain-* -maxdepth 2 -path '*/bin/*-openwrt-linux-*-gcc' -type f | awk 'NR==1')
+          [ -n "$TC_GCC" ] && "$TC_GCC" --version >/dev/null 2>&1 || { echo "::error::工具鏈校驗失敗！"; exit 1; }
+
+          mkdir -p /tmp/tc_bundle
+          tar -I 'zstd -T0 -3' -cf /tmp/tc_bundle/toolchain.tar.zst staging_dir dl
+          ls -lh /tmp/tc_bundle/toolchain.tar.zst
+
+      - name: 上傳單次臨時共享工具鏈 (Upload Ephemeral Toolchain)
+        uses: actions/upload-artifact@v7
+        with:
+          name: ephemeral-tc-${{ matrix.ts_slug }}-${{ github.run_id }}
+          path: /tmp/tc_bundle/toolchain.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  # ===========================================================================
+  # 階段 3：按平台分組 × 格式並行極速編譯（無長期緩存・Multi-Profile・Std->Pro 增量）
+  # ===========================================================================
+  build:
+    name: 平台編譯 (${{ matrix.ts }}・${{ matrix.img_fmt }}・${{ needs.prepare.outputs.resolved_ver }})
+    needs: [prepare, toolchain]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.should_build == 'true' && (needs.toolchain.result == 'success' || needs.toolchain.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.build_matrix_json) }}
+    permissions:
+      contents: read
+      actions: read
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      TARGET_NAME: ${{ matrix.target }}
+      SUBTARGET_NAME: ${{ matrix.subtarget }}
+      TS_PAIR: ${{ matrix.ts }}
+      TS_SLUG: ${{ matrix.ts_slug }}
+      IMG_FMT: ${{ matrix.img_fmt }}
+      TARGETS: ${{ matrix.profiles }}
+      USE_SHARED_TC: ${{ matrix.use_shared_tc }}
+    steps:
+      - name: 載入建置設定至環境變數 (Load Build Config)
+        id: cfg
+        env:
+          BUILD_CONFIG_JSON: ${{ needs.prepare.outputs.build_config_json }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PYEOF'
+          import json
+          import os
+
+          cfg = json.loads(os.environ["BUILD_CONFIG_JSON"])
+          mapping = {
+              "SOURCE_REF": "source_ref", "RESOLVED_VER": "resolved_ver",
+              "IMG_FMT_MODE": "img_fmt_mode", "VARIANTS": "variants",
+              "LAN_IP_VAL": "lan_ip", "HOSTNAME_VAL": "hostname",
+              "LOGIN_USER_VAL": "login_user", "LOGIN_PASS_VAL": "login_pass",
+              "COUNTRY_VAL": "country_code", "TZ_NAME": "tz_name", "TZ_POSIX": "tz_posix",
+              "NEED_PRO": "need_pro", "NEED_NIKKI": "need_nikki",
+              "NEED_RTP2HTTPD": "need_rtp2httpd", "HAS_PRO_PLUGINS": "has_pro_plugins",
+              "ENABLE_NIKKI": "enable_nikki", "ENABLE_RTP2HTTPD": "enable_rtp2httpd",
+              "ENABLE_ARGON": "enable_argon", "ENABLE_TTYD": "enable_ttyd",
+              "ENABLE_SFTP": "enable_sftp", "ENABLE_WWAN": "enable_wwan",
+              "ENABLE_BBR": "enable_bbr", "SKIP_UNSUPPORTED": "skip_unsupported",
+              "BUILD_START_TIME": "build_start_time",
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as ef:
+              for ek, jk in mapping.items():
+                  val = str(cfg.get(jk, "")).replace("\r", "").replace("\n", "")
+                  ef.write(f"{ek}={val}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as of:
+              of.write(f"need_nikki={cfg.get('need_nikki', 'false')}\n")
+              of.write(f"resolved_ver={cfg.get('resolved_ver', '')}\n")
+          PYEOF
+
+      - name: 下載單次臨時共享工具鏈 (Download Ephemeral Toolchain)
+        if: ${{ matrix.use_shared_tc == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: ephemeral-tc-${{ matrix.ts_slug }}-${{ github.run_id }}
+          path: /tmp/tc_bundle
+
+      - name: 併發環境初始化、拉取源碼並按需掛載工具鏈 (Parallel Fast Init)
+        run: |
+          set -euo pipefail
+          CANCELLED=0
+          ACTIVE_PID=""
+          kill_tree() {
+            local p="$1" sig="${2:-TERM}" c
+            for c in $(pgrep -P "$p" 2>/dev/null || true); do
+              kill_tree "$c" "$sig"
+            done
+            kill "-${sig}" "$p" 2>/dev/null || true
+          }
+          on_cancel() {
+            CANCELLED=1
+            trap - INT TERM
+            echo "::warning::收到取消信號，正在立即終止所有子進程..."
+            [ -n "$ACTIVE_PID" ] && kill_tree "$ACTIVE_PID" TERM
+            for c in $(pgrep -P $$ 2>/dev/null || true); do kill_tree "$c" TERM; done
+            sleep 1
+            [ -n "$ACTIVE_PID" ] && kill_tree "$ACTIVE_PID" KILL
+            for c in $(pgrep -P $$ 2>/dev/null || true); do kill_tree "$c" KILL; done
+            exit 130
+          }
+          trap on_cancel INT TERM
+          run_interruptible() {
+            local rc=0
+            "$@" &
+            ACTIVE_PID=$!
+            wait "$ACTIVE_PID" || rc=$?
+            ACTIVE_PID=""
+            return "$rc"
+          }
+          mkdir -p /tmp/init_logs
+
+          echo "::group::多路併發初始化 (磁碟清理 || APT 依賴 || 源碼 Clone || 外部組件預取)"
+          (
+            printf '%s\n' /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+              /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/swift \
+              /usr/share/miniconda /usr/local/graalvm /usr/local/.ghcup \
+              /usr/local/share/powershell /usr/local/share/chromium /usr/local/lib/node_modules /opt/az \
+              | xargs -P "$(nproc)" sudo rm -rf
+          ) >/tmp/init_logs/clean.log 2>&1 &
+          PID_CLEAN=$!
+
+          (
+            for attempt in 1 2 3; do
+              rm -rf openwrt
+              if git clone --depth 1 --single-branch -b "$SOURCE_REF" https://github.com/immortalwrt/immortalwrt.git openwrt; then
+                exit 0
+              fi
+              [ "$attempt" -eq 3 ] && exit 1
+              sleep $((attempt * 5))
+            done
+          ) >/tmp/init_logs/clone.log 2>&1 &
+          PID_CLONE=$!
+
+          PID_RTP=""
+          if [ "$NEED_RTP2HTTPD" = "true" ]; then
+            (
+              rm -rf /tmp/rtp2httpd
+              for attempt in 1 2 3; do
+                if git clone --depth 1 --single-branch https://github.com/stackia/rtp2httpd.git /tmp/rtp2httpd; then
+                  exit 0
+                fi
+                rm -rf /tmp/rtp2httpd
+                [ "$attempt" -eq 3 ] && exit 1
+                sleep $((attempt * 4))
+              done
+            ) >/tmp/init_logs/rtp.log 2>&1 &
+            PID_RTP=$!
+          fi
+
+          PID_UPX=""
+          if [ "$NEED_NIKKI" = "true" ]; then
+            (
+              UPX_VER="4.2.4"
+              if curl -fsSL --retry 3 --retry-delay 2 \
+                "https://github.com/upx/upx/releases/download/v${UPX_VER}/upx-${UPX_VER}-amd64_linux.tar.xz" -o /tmp/upx.tar.xz; then
+                tar -Jxf /tmp/upx.tar.xz -C /tmp
+                sudo install -m 0755 "/tmp/upx-${UPX_VER}-amd64_linux/upx" /usr/local/bin/upx
+                rm -rf /tmp/upx*
+              fi
+            ) >/tmp/init_logs/upx.log 2>&1 &
+            PID_UPX=$!
+          fi
+
+          sudo rm -rf /var/lib/man-db/auto-update
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq -o Dpkg::Use-Pty=0 install -y --no-install-recommends \
+            ack autoconf automake autopoint binutils bison build-essential bzip2 \
+            ca-certificates cmake cpio curl device-tree-compiler file flex \
+            g++ g++-multilib gawk gcc gcc-multilib genisoimage gettext git gperf \
+            intltool jq lib32gcc-s1 libc6-dev-i386 libdw-dev libelf-dev libfuse-dev \
+            libglib2.0-dev libgmp-dev libltdl-dev libmbedtls-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libzstd-dev ninja-build openssl patch pkgconf python3 python3-pip \
+            python3-ply python3-pyelftools python3-setuptools re2c rsync \
+            squashfs-tools swig texinfo time u-boot-tools unzip wget xsltproc \
+            xxd xz-utils zlib1g-dev zstd
+          sudo -E apt-get -qq clean
+          sudo timedatectl set-timezone "$TZ_NAME" 2>/dev/null || true
+
+          wait "$PID_CLEAN" || true
+          wait "$PID_CLONE" || { cat /tmp/init_logs/clone.log; echo "::error::拉取 ImmortalWrt 源碼失敗！"; exit 1; }
+          [ -n "$PID_RTP" ] && { wait "$PID_RTP" || { cat /tmp/init_logs/rtp.log; echo "::error::拉取 rtp2httpd 失敗！"; exit 1; }; }
+          [ -n "$PID_UPX" ] && { wait "$PID_UPX" || true; }
+
+          if [ "$USE_SHARED_TC" = "true" ]; then
+            [ -s /tmp/tc_bundle/toolchain.tar.zst ] || { echo "::error::缺少共享工具鏈壓縮包！"; exit 1; }
+            tar -I 'zstd -d -T0' -xf /tmp/tc_bundle/toolchain.tar.zst -C openwrt
+            rm -rf /tmp/tc_bundle
+            find openwrt/staging_dir -path '*/stamp/*' -type f -exec touch {} + 2>/dev/null || true
+            TC_GCC=$(find openwrt/staging_dir/toolchain-* -maxdepth 2 -path '*/bin/*-openwrt-linux-*-gcc' -type f | awk 'NR==1')
+            [ -n "$TC_GCC" ] && "$TC_GCC" --version >/dev/null 2>&1 || { echo "::error::共享工具鏈校驗失敗！"; exit 1; }
+            echo "[OK][共享工具鏈就緒] $("$TC_GCC" --version | awk 'NR==1')"
+          fi
+
+          UPSTREAM_COMMIT_UNIX=$(git -C openwrt log -1 --format="%ct" 2>/dev/null || true)
+          UPSTREAM_COMMIT_HASH=$(git -C openwrt log -1 --format="%h" 2>/dev/null || echo "latest")
+          if [ -n "$UPSTREAM_COMMIT_UNIX" ]; then
+            UPSTREAM_COMMIT_TIME=$(TZ="$TZ_NAME" date -d "@${UPSTREAM_COMMIT_UNIX}" "+%Y年%m月%d日 %H時%M分")
+          else
+            UPSTREAM_COMMIT_TIME="${BUILD_START_TIME}"
+          fi
+          {
+            echo "UPSTREAM_COMMIT_TIME=${UPSTREAM_COMMIT_TIME}"
+            echo "UPSTREAM_COMMIT_HASH=${UPSTREAM_COMMIT_HASH}"
+          } >> "$GITHUB_ENV"
+          echo "::endgroup::"
+
+      - name: 按需適配設備硬體與原生格式規則 (Device Hardware Adaptation)
+        working-directory: ./openwrt
+        run: |
+          set -euo pipefail
+          [ "$TS_PAIR" = "mediatek/filogic" ] || { echo "[OK][${TS_PAIR}] 採用官方原生硬體定義。"; exit 0; }
+
+          python3 - "$IMG_FMT" "$TARGETS" << 'PYEOF'
+          import glob
+          import os
+          import re
+          import sys
+
+          img_fmt = sys.argv[1] if len(sys.argv) > 1 else "bin"
+          active_devs = set(sys.argv[2].split()) if len(sys.argv) > 2 else set()
+
+          has_cudy = "cudy_tr3000-v1" in active_devs
+          has_rax = "cmcc_rax3000m-emmc" in active_devs
+          has_jd = "jdcloud_re-cp-03" in active_devs
+          has_emmc_yuzhii = has_rax or has_jd
+
+          if has_cudy:
+              for dts_file in glob.glob("target/linux/mediatek/dts/*cudy-tr3000-v1*.dts*"):
+                  s = open(dts_file, "r", encoding="utf-8").read()
+                  new_s, n = re.subn(r'reg\s*=\s*<0x0*5c0000\s+0x0*4000000>;', 'reg = <0x5c0000 0x7000000>;', s)
+                  if n > 0:
+                      open(dts_file, "w", encoding="utf-8").write(new_s)
+                      print(f"[OK][cudy_tr3000-v1] 已將 {dts_file} 擴展為 112M")
+
+          if img_fmt == "itb":
+              if has_cudy:
+                  has_ubootmod = any(
+                      re.search(r'^define\s+Device/cudy_tr3000-v1-ubootmod\b', open(p, encoding="utf-8").read(), flags=re.M)
+                      for p in glob.glob("target/linux/mediatek/image/*.mk")
+                  )
+                  if not has_ubootmod:
+                      patched_any = False
+                      for mk_path in glob.glob("target/linux/mediatek/image/*.mk"):
+                          raw_lines = open(mk_path, "r", encoding="utf-8").read().splitlines()
+                          out_lines, in_cudy, patched = [], False, False
+                          for line in raw_lines:
+                              stripped = line.strip()
+                              if re.match(r'^define\s+Device/cudy_tr3000-v1\b', stripped):
+                                  in_cudy = True; out_lines.append(line); continue
+                              if in_cudy:
+                                  if stripped == "endef":
+                                      out_lines.extend([
+                                          "  KERNEL := kernel-bin | gzip",
+                                          "  KERNEL_INITRAMFS := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k",
+                                          "  KERNEL_INITRAMFS_SUFFIX := -recovery.itb",
+                                          "  IMAGES := sysupgrade.itb",
+                                          "  IMAGE_SIZE := 114688k",
+                                          "  IMAGE/sysupgrade.itb := append-kernel | fit gzip $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb external-static-with-rootfs | pad-rootfs | append-metadata",
+                                          line,
+                                      ])
+                                      in_cudy, patched = False, True; continue
+                                  if any(stripped.startswith(k) for k in ("IMAGES", "IMAGE/", "IMAGE_SIZE", "KERNEL")):
+                                      continue
+                              out_lines.append(line)
+                          if patched:
+                              open(mk_path, "w", encoding="utf-8").write("\n".join(out_lines) + "\n")
+                              patched_any = True
+                      if not patched_any:
+                          print("::error::[ITB] 找不到 cudy_tr3000-v1 設備定義！", file=sys.stderr); sys.exit(1)
+              sys.exit(0)
+
+          if not (has_cudy or has_emmc_yuzhii):
+              sys.exit(0)
+
+          def extract_dtso_to_dts(dtso_text: str) -> str:
+              dtso_text = re.sub(r'^\s*rootdisk\s*=\s*<&[^>]+>;\s*\n?', '', dtso_text, flags=re.M)
+              if "fragment@" not in dtso_text:
+                  cleaned = re.sub(r'^\s*/(dts-v1|plugin)/;\s*\n?', '', dtso_text, flags=re.M)
+                  cleaned = re.sub(r'/\s*\{\s*compatible\s*=\s*[^;]+;\s*\};\s*', '', cleaned, flags=re.S)
+                  return "\n" + cleaned.strip() + "\n"
+              out, pos = [], 0
+              while True:
+                  m = re.search(r'fragment@\d+\s*\{', dtso_text[pos:])
+                  if not m: break
+                  start, depth = pos + m.end(), 1
+                  i = start
+                  while i < len(dtso_text) and depth > 0:
+                      if dtso_text[i] == '{': depth += 1
+                      elif dtso_text[i] == '}': depth -= 1
+                      i += 1
+                  frag_body, pos = dtso_text[start:i - 1], i
+                  t_m = re.search(r'target\s*=\s*<(&[a-zA-Z0-9_]+)>;', frag_body)
+                  tp_m = re.search(r'target-path\s*=\s*"([^"]+)";', frag_body)
+                  o_m = re.search(r'__overlay__\s*\{', frag_body)
+                  if o_m:
+                      o_start, o_depth = o_m.end(), 1
+                      j = o_start
+                      while j < len(frag_body) and o_depth > 0:
+                          if frag_body[j] == '{': o_depth += 1
+                          elif frag_body[j] == '}': o_depth -= 1
+                          j += 1
+                      overlay_body = frag_body[o_start:j - 1]
+                      if not overlay_body.strip(): continue
+                      if t_m and t_m.group(1) != "&chosen":
+                          out.append(f"\n{t_m.group(1)} {{{overlay_body}}};\n")
+                      elif (t_m and t_m.group(1) == "&chosen") or (tp_m and tp_m.group(1) == "/chosen"):
+                          out.append(f"\n/ {{\n\tchosen {{{overlay_body}}};\n}};\n")
+                      elif tp_m and tp_m.group(1) == "/":
+                          out.append(f"\n/ {{{overlay_body}}};\n")
+              return "".join(out)
+
+          rax_dts = "target/linux/mediatek/dts/mt7981b-cmcc-rax3000m.dts"
+          rax_dtso = "target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-emmc.dtso"
+          if has_rax and os.path.exists(rax_dts) and os.path.exists(rax_dtso):
+              dts_c = open(rax_dts, "r", encoding="utf-8").read()
+              dtso_c = open(rax_dtso, "r", encoding="utf-8").read()
+              if "&mmc0" not in dts_c and ("fragment@" in dtso_c or "&mmc0" in dtso_c):
+                  open(rax_dts, "w", encoding="utf-8").write(dts_c + "\n/* Merged from emmc.dtso */\n" + extract_dtso_to_dts(dtso_c))
+
+          bootargs_line = 'bootargs = "console=ttyS0,115200n1 loglevel=8 earlycon=uart8250,mmio32,0x11002000 root=PARTLABEL=rootfs rootwait";'
+          for emmc_dts in ([rax_dts] if has_rax else []) + (["target/linux/mediatek/dts/mt7986a-jdcloud-re-cp-03.dts"] if has_jd else []):
+              if os.path.exists(emmc_dts):
+                  s = open(emmc_dts, "r", encoding="utf-8").read()
+                  s = s.replace('block-partition-production', 'block-partition-rootfs').replace('partname = "production"', 'partname = "rootfs"')
+                  s = re.sub(r'^\s*rootdisk\s*=\s*<&[^>]+>;\s*\n?', '', s, flags=re.M)
+                  s = re.sub(r'^\s*bootargs(-override|-append)?\s*=\s*"[^"]*";\s*\n?', '', s, flags=re.M)
+                  s, n = re.subn(r'(chosen\s*\{)', rf'\1\n\t\t{bootargs_line}', s, count=1)
+                  if n == 0: s += f"\n/ {{\n\tchosen {{\n\t\t{bootargs_line}\n\t}};\n}};\n"
+                  open(emmc_dts, "w", encoding="utf-8").write(s)
+
+          SKIP_KEYS = (
+              "DEVICE_DTS_OVERLAY", "DEVICE_DTS_LOADADDR", "KERNEL", "KERNEL_INITRAMFS",
+              "KERNEL_INITRAMFS_SUFFIX", "IMAGES", "IMAGE_SIZE", "IMAGE/sysupgrade.itb",
+              "IMAGE/sysupgrade.bin", "ARTIFACTS", "ARTIFACT/", "COMPAT_VERSION",
+              "COMPAT_MESSAGE", "UBOOTENV_IN_UBI", "KERNEL_IN_UBI",
+          )
+
+          total_patched = []
+          for mk_path in glob.glob("target/linux/mediatek/image/*.mk"):
+              raw_lines = open(mk_path, "r", encoding="utf-8").read().splitlines()
+              out_lines, in_mode, dev_name, skip_cont, patched_in_file = [], None, "", False, []
+              for line in raw_lines:
+                  stripped = line.strip()
+                  m_def = re.match(r'^define\s+Device/([a-zA-Z0-9_-]+)', stripped)
+                  if m_def and in_mode is None:
+                      dname = m_def.group(1)
+                      if has_cudy and dname == "cudy_tr3000-v1":
+                          in_mode, dev_name = "cudy", dname; out_lines.append(line); continue
+                      elif (has_rax and dname.startswith("cmcc_rax3000m")) or (has_jd and dname.startswith("jdcloud_re-cp-03")):
+                          in_mode, dev_name, skip_cont = "emmc", dname, False; out_lines.append(line); continue
+                  if in_mode == "cudy":
+                      if stripped == "endef":
+                          in_mode = None; patched_in_file.append(dev_name); out_lines.append(line); continue
+                      line = re.sub(r'IMAGE_SIZE\s*[:+]?=\s*65536k', 'IMAGE_SIZE := 114688k', line).replace("sysupgrade-tar", "append-ubi | check-size")
+                      out_lines.append(line); continue
+                  if in_mode == "emmc":
+                      if stripped == "endef":
+                          out_lines.extend([
+                              "  DEVICE_DTS_OVERLAY :=", "  KERNEL_IN_UBI :=", "  UBOOTENV_IN_UBI :=", "  ARTIFACTS :=",
+                              "  KERNEL := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb",
+                              "  KERNEL_INITRAMFS := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k",
+                              "  KERNEL_INITRAMFS_SUFFIX := -kernel.bin",
+                              "  IMAGES := sysupgrade.bin",
+                              "  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata",
+                              line,
+                          ])
+                          in_mode, skip_cont = None, False; patched_in_file.append(dev_name); continue
+                      if skip_cont:
+                          if not stripped.endswith("\\"): skip_cont = False
+                          continue
+                      first_tok = stripped.split()[0] if stripped.split() else ""
+                      if any(first_tok == k or first_tok.startswith("ARTIFACT/") for k in SKIP_KEYS):
+                          if stripped.endswith("\\"): skip_cont = True
+                          continue
+                      out_lines.append(line); continue
+                  out_lines.append(line)
+              if patched_in_file:
+                  open(mk_path, "w", encoding="utf-8").write("\n".join(out_lines) + "\n")
+                  total_patched.extend(patched_in_file)
+
+          for req in (["cudy_tr3000-v1"] if has_cudy else []) + (["jdcloud_re-cp-03"] if has_jd else []) + (["cmcc_rax3000m"] if has_rax else []):
+              if not any(p.startswith(req) for p in total_patched):
+                  print(f"::error::[BIN] 找不到設備定義: {req}", file=sys.stderr); sys.exit(1)
+
+          if has_emmc_yuzhii:
+              plat_sh = "target/linux/mediatek/filogic/base-files/lib/upgrade/platform.sh"
+              if os.path.exists(plat_sh):
+                  ps = open(plat_sh, "r", encoding="utf-8").read()
+                  ps = re.sub(r'^\s*(cmcc,rax3000m|jdcloud,re-cp-03)\|\\\n', '', ps, flags=re.M)
+                  ps = ps.replace('CI_KERNPART="production"', 'CI_KERNPART="kernel"\n\t\tCI_ROOTPART="rootfs"')
+                  ps, n1 = re.subn(r'^([ \t]*)(acer,predator-w6\|\\\n)', r'\1cmcc,rax3000m|\\\n\1jdcloud,re-cp-03|\\\n\1\2', ps, count=1, flags=re.M)
+                  if n1 == 0: ps, n1 = re.subn(r'(\t[^\n]+\)\n\t\tCI_KERNPART="kernel")', r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03|\\\n\1', ps, count=1)
+                  ps, n2 = re.subn(r'(\t[^\n]+\|\\\n\t[^\n]+\)\n\t\temmc_copy_config)', r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03|\\\n\1', ps, count=1)
+                  if n2 == 0: ps, n2 = re.subn(r'(\t[^\n]+\)\n\t\temmc_copy_config)', r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03|\\\n\1', ps, count=1)
+                  if 'nand_do_platform_check' in ps:
+                      ps = re.sub(r'(\*\)\n\t\tnand_do_platform_check)', r'\tcmcc,rax3000m|\\\n\tjdcloud,re-cp-03)\n\t\treturn 0\n\t\t;;\n\t\1', ps, count=1)
+                  if n1 == 0 or n2 == 0:
+                      print(f"::error::platform.sh 結構變更 (n1={n1}, n2={n2})！", file=sys.stderr); sys.exit(1)
+                  open(plat_sh, "w", encoding="utf-8").write(ps)
+
+              for bf in [
+                  "target/linux/mediatek/filogic/base-files/etc/board.d/02_network",
+                  "target/linux/mediatek/filogic/base-files/etc/hotplug.d/firmware/11-mt76-caldata",
+                  "target/linux/mediatek/filogic/base-files/etc/hotplug.d/ieee80211/11_fix_wifi_mac",
+                  "package/boot/uboot-envtools/files/mediatek_filogic",
+                  plat_sh,
+              ]:
+                  if os.path.exists(bf):
+                      c = open(bf, "r", encoding="utf-8").read()
+                      if "/dev/mmc*)" in c:
+                          open(bf, "w", encoding="utf-8").write(c.replace("/dev/mmc*)", '/dev/mmc*|PARTLABEL=*|"")'))
+          PYEOF
+
+      - name: 更新軟體源並整合外部插件 (Update Feeds & Extra Plugins)
+        working-directory: ./openwrt
+        run: |
+          set -euo pipefail
+          retry() {
+            local max_attempts=$1; shift; local attempt=1 rc=0
+            while true; do
+              rc=0; "$@" || rc=$?
+              [ "$rc" -eq 0 ] && return 0
+              [ "$rc" -ge 128 ] && return "$rc"
+              [ "$attempt" -ge "$max_attempts" ] && return "$rc"
+              sleep $((attempt * 4))
+              attempt=$((attempt + 1))
+            done
+          }
+
+          echo "::group::更新 Feeds 與整合已啟用外部插件"
+          if [ "$NEED_NIKKI" = "true" ]; then
+            echo "src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main" >> feeds.conf.default
+          fi
+          retry 3 ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          if [ "$NEED_NIKKI" = "true" ]; then
+            ./scripts/feeds install -a -f -p nikki
+            for mk in feeds/nikki/nikki/Makefile package/feeds/nikki/nikki/Makefile; do
+              [ -f "$mk" ] && sed -i -E 's/\+mihomo(-[a-zA-Z0-9_-]+)?([[:space:]]|\\|$)/\2/g' "$mk"
+            done
+            if [ -f scripts/rstrip.sh ]; then
+              python3 - << 'PYEOF'
+          import re
+          import sys
+
+          path = "scripts/rstrip.sh"
+          content = open(path, "r", encoding="utf-8").read()
+          if "mihomo*" in content: sys.exit(0)
+          new_content, n = re.subn(r'(find\s+"?\$\{?TARGETS\}?"?(?:[^\n]|\\\n)*?\s-type\s+f)\b', r'\1 ! -name "mihomo*"', content)
+          if n == 0:
+              new_content, n = re.subn(
+                  r'(while\s+read(?:\s+-r)?\s+([A-Za-z_][A-Za-z0-9_]*)\b[^\n]*(?:;\s*|\n\s*)do\n)',
+                  r'\1\t\tcase "${\2}" in *mihomo*) echo "$SELF: ${\2}: skipped (mihomo* whitelist)"; continue ;; esac\n',
+                  content,
+              )
+          if n == 0:
+              print("::error::scripts/rstrip.sh 白名單規則套用失敗！", file=sys.stderr); sys.exit(1)
+          open(path, "w", encoding="utf-8").write(new_content)
+          print(f"[OK] 已套用 scripts/rstrip.sh mihomo* 白名單 (更新 {n} 處)")
+          PYEOF
+            fi
+          fi
+
+          if [ "$NEED_RTP2HTTPD" = "true" ]; then
+            rm -rf feeds/packages/net/rtp2httpd feeds/luci/applications/luci-app-rtp2httpd \
+              package/feeds/packages/rtp2httpd package/feeds/luci/luci-app-rtp2httpd \
+              package/rtp2httpd package/luci-app-rtp2httpd
+            if [ ! -d /tmp/rtp2httpd/openwrt-support/rtp2httpd ]; then
+              rm -rf /tmp/rtp2httpd
+              retry 3 git clone --depth 1 --single-branch https://github.com/stackia/rtp2httpd.git /tmp/rtp2httpd
+            fi
+            cp -rf /tmp/rtp2httpd/openwrt-support/rtp2httpd package/rtp2httpd
+            cp -rf /tmp/rtp2httpd/openwrt-support/luci-app-rtp2httpd package/luci-app-rtp2httpd
+            [ -f package/rtp2httpd/Makefile.versioned ] && mv -f package/rtp2httpd/Makefile.versioned package/rtp2httpd/Makefile
+            [ -f package/luci-app-rtp2httpd/Makefile.versioned ] && mv -f package/luci-app-rtp2httpd/Makefile.versioned package/luci-app-rtp2httpd/Makefile
+            rm -rf /tmp/rtp2httpd
+          fi
+
+          if [ "$ENABLE_ARGON" = "Y" ]; then
+            find feeds/luci/collections/ -name "Makefile" -exec sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' {} + || true
+          fi
+          echo "::endgroup::"
+
+      - name: 套用固件預設（IP、帳密、國家/地區、時區、BBR 與官方 kmods）
+        working-directory: ./openwrt
+        run: |
+          set -euo pipefail
+          TARGET_VER="${RESOLVED_VER}"
+
+          # 1. 套用 LAN IP、主機名、時區至 base-files
+          for cfg in \
+            package/base-files/files/bin/config_generate \
+            package/base-files/luci2/bin/config_generate \
+            package/base-files/files/lib/preinit/00_preinit.conf; do
+            if [ -f "$cfg" ]; then
+              sed -i "s/192\.168\.1\.1/${LAN_IP_VAL}/g" "$cfg"
+              sed -i "s/hostname='OpenWrt'/hostname='${HOSTNAME_VAL}'/g; s/hostname=\"OpenWrt\"/hostname=\"${HOSTNAME_VAL}\"/g" "$cfg"
+            fi
+          done
+
+          # 2. 預計算 SHA-512 密碼雜湊（不於路由器腳本殘留明文）
+          LOGIN_PASS_HASH=""
+          if [ -n "$LOGIN_PASS_VAL" ]; then
+            LOGIN_PASS_HASH=$(printf '%s\n' "$LOGIN_PASS_VAL" | openssl passwd -6 -stdin)
+            if [[ "$LOGIN_PASS_HASH" != \$6\$* ]] || [[ "$LOGIN_PASS_HASH" == *:* ]] || [[ "$LOGIN_PASS_HASH" == *\'* ]]; then
+              echo "::error::無法產生合法的 SHA-512 密碼雜湊！"; exit 1
+            fi
+          fi
+
+          # 3. 修正發行版標識
+          if [ -f include/version.mk ]; then
+            sed -i -E \
+              -e 's/VERSION_DIST:=OpenWrt/VERSION_DIST:=ImmortalWrt/g' \
+              -e 's/VERSION_DIST\),OpenWrt/VERSION_DIST),ImmortalWrt/g' \
+              -e "s/VERSION_NUMBER:=[0-9]+\.[0-9]+-SNAPSHOT/VERSION_NUMBER:=${TARGET_VER}/g" \
+              -e "s/VERSION_NUMBER\),[0-9]+\.[0-9]+-SNAPSHOT/VERSION_NUMBER),${TARGET_VER}/g" \
+              include/version.mk
+          fi
+          for icfg in package/base-files/image-config.in Config.in; do
+            [ -f "$icfg" ] && sed -i -E \
+              -e 's/default "OpenWrt"/default "ImmortalWrt"/g' \
+              -e "s/default \"[0-9]+\.[0-9]+-SNAPSHOT\"/default \"${TARGET_VER}\"/g" "$icfg"
+          done
+
+          # 4. 自動對齊官方 kmods vermagic
+          KMAJOR=$(awk -F':=' '/^KERNEL_PATCHVER/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "target/linux/${TARGET_NAME}/Makefile" 2>/dev/null || true)
+          KMINOR=""
+          [ -n "$KMAJOR" ] && [ -f "include/kernel-${KMAJOR}" ] && \
+            KMINOR=$(awk -F'=' -v km="$KMAJOR" '$1 ~ "LINUX_VERSION-"km {gsub(/[[:space:]]/,"",$2); print $2; exit}' "include/kernel-${KMAJOR}" 2>/dev/null || true)
+          FULL_KVER="${KMAJOR}${KMINOR}"
+
+          OFFICIAL_KMOD_DIR=""
+          OFFICIAL_VERMAGIC=""
+          KMOD_URLS=("https://downloads.immortalwrt.org/releases/${TARGET_VER}/targets/${TARGET_NAME}/${SUBTARGET_NAME}/kmods/")
+          [[ "$TARGET_VER" == *SNAPSHOT* ]] && KMOD_URLS+=("https://downloads.immortalwrt.org/snapshots/targets/${TARGET_NAME}/${SUBTARGET_NAME}/kmods/")
+
+          for base_url in "${KMOD_URLS[@]}"; do
+            KMOD_HTML=$(curl -fsSL --retry 2 --connect-timeout 8 "$base_url" 2>/dev/null || true)
+            [ -n "$KMOD_HTML" ] || continue
+            CAND_DIR=""
+            [ -n "$FULL_KVER" ] && CAND_DIR=$(printf '%s\n' "$KMOD_HTML" | grep -oE "${FULL_KVER//./\\.}-[0-9]+-[0-9a-f]{32}" | sort -uV | tail -n 1 || true)
+            [ -z "$CAND_DIR" ] && [ -n "$KMAJOR" ] && CAND_DIR=$(printf '%s\n' "$KMOD_HTML" | grep -oE "${KMAJOR//./\\.}\.[0-9]+-[0-9]+-[0-9a-f]{32}" | sort -uV | tail -n 1 || true)
+            [ -z "$CAND_DIR" ] && [[ "$base_url" == *"/releases/${TARGET_VER}/"* ]] && CAND_DIR=$(printf '%s\n' "$KMOD_HTML" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[0-9a-f]{32}' | sort -uV | tail -n 1 || true)
+            if [ -n "$CAND_DIR" ]; then
+              CAND_MAGIC="${CAND_DIR##*-}"
+              if [ "${#CAND_MAGIC}" -eq 32 ]; then
+                OFFICIAL_KMOD_DIR="$CAND_DIR"
+                OFFICIAL_VERMAGIC="$CAND_MAGIC"
+                echo "[OK] 匹配官方 kmods: ${OFFICIAL_KMOD_DIR}"
+                break
+              fi
+            fi
+          done
+
+          if [ "${#OFFICIAL_VERMAGIC}" -eq 32 ] && [ -f include/kernel-defaults.mk ]; then
+            python3 - "$OFFICIAL_VERMAGIC" << 'PYEOF'
+          import re
+          import sys
+
+          magic = sys.argv[1]
+          path = "include/kernel-defaults.mk"
+          content = open(path, "r", encoding="utf-8").read()
+          new_content, n = re.subn(
+              r'^(\t).*?\$\(MKHASH\)\s+md5\s*>\s*\$\(LINUX_DIR\)/\.vermagic\b.*$',
+              rf"\1echo '{magic}' > $(LINUX_DIR)/.vermagic",
+              content, flags=re.M,
+          )
+          if n > 0:
+              open(path, "w", encoding="utf-8").write(new_content)
+              print(f"[OK] 核心 vermagic 已鎖定為 {magic}")
+          PYEOF
+          fi
+
+          # 5. BBR 與首次開機預設腳本（IP / 主機名 / 時區 / 國家地區無線監管域 / 帳密 / kmods）
+          mkdir -p files/etc/uci-defaults
+          if [ "$ENABLE_BBR" = "Y" ]; then
+            mkdir -p files/etc/sysctl.d
+            echo "net.ipv4.tcp_congestion_control=bbr" > files/etc/sysctl.d/99-turboacc-bbr.conf
+          fi
+
+          {
+            echo '#!/bin/sh'
+            printf "TARGET_VER='%s'\n" "${TARGET_VER}"
+            printf "TS_PAIR='%s'\n" "${TS_PAIR}"
+            printf "LAN_IP='%s'\n" "${LAN_IP_VAL}"
+            printf "HOSTNAME_VAL='%s'\n" "${HOSTNAME_VAL}"
+            printf "LOGIN_USER='%s'\n" "${LOGIN_USER_VAL}"
+            printf "LOGIN_PASS_HASH='%s'\n" "${LOGIN_PASS_HASH}"
+            printf "COUNTRY_CODE='%s'\n" "${COUNTRY_VAL}"
+            printf "TZ_NAME='%s'\n" "${TZ_NAME}"
+            printf "TZ_POSIX='%s'\n" "${TZ_POSIX}"
+            printf "OFFICIAL_KMOD_DIR='%s'\n" "${OFFICIAL_KMOD_DIR}"
+            printf "OFFICIAL_VERMAGIC='%s'\n" "${OFFICIAL_VERMAGIC}"
+            cat << 'UCIEOF'
+          # 網路位址
+          uci set network.lan.ipaddr="${LAN_IP}"
+          uci set network.lan.netmask='255.255.255.0'
+          uci commit network
+
+          # 主機名稱與時區（預設台灣/台北 Asia/Taipei, CST-8）
+          uci set system.@system[0].hostname="${HOSTNAME_VAL}"
+          uci set system.@system[0].zonename="${TZ_NAME}"
+          uci set system.@system[0].timezone="${TZ_POSIX}"
+          uci commit system
+          echo "${HOSTNAME_VAL}" > /proc/sys/kernel/hostname
+
+          # 國家/地區無線監管域（預設 TW）
+          if [ -n "${COUNTRY_CODE}" ] && [ -f /etc/config/wireless ]; then
+            for radio in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
+              uci set "wireless.${radio}.country=${COUNTRY_CODE}"
+            done
+            uci commit wireless
+          fi
+
+          # 登入帳號與 SHA-512 密碼雜湊
+          set_shadow_hash() {
+            local u="$1" h="$2"
+            [ -f /etc/shadow ] || return 0
+            if grep -q "^${u}:" /etc/shadow; then
+              TARGET_USER="$u" TARGET_HASH="$h" awk -F: 'BEGIN{OFS=":"} $1==ENVIRON["TARGET_USER"]{$2=ENVIRON["TARGET_HASH"]} {print}' /etc/shadow > /etc/shadow.tmp
+              mv -f /etc/shadow.tmp /etc/shadow
+            else
+              printf '%s:%s:0:0:99999:7:::\n' "$u" "$h" >> /etc/shadow
+            fi
+            chmod 0600 /etc/shadow
+          }
+
+          set_shadow_hash "root" "${LOGIN_PASS_HASH}"
+          if [ "${LOGIN_USER}" != "root" ]; then
+            [ -f /etc/passwd ] && ! grep -q "^${LOGIN_USER}:" /etc/passwd && \
+              printf '%s:x:0:0:%s:/root:/bin/ash\n' "${LOGIN_USER}" "${LOGIN_USER}" >> /etc/passwd
+            set_shadow_hash "${LOGIN_USER}" "${LOGIN_PASS_HASH}"
+            if [ -f /etc/config/rpcd ] && ! grep -q "option username '${LOGIN_USER}'" /etc/config/rpcd; then
+              uci add rpcd login >/dev/null
+              uci set rpcd.@login[-1].username="${LOGIN_USER}"
+              uci set rpcd.@login[-1].password='$p$'"${LOGIN_USER}"
+              uci add_list rpcd.@login[-1].read='*'
+              uci add_list rpcd.@login[-1].write='*'
+              uci commit rpcd
+            fi
+          fi
+
+          # 發行版名稱與軟體源清理
+          for rel in /etc/openwrt_release /etc/os-release /usr/lib/os-release; do
+            [ -f "$rel" ] && sed -i -E "s/OpenWrt/ImmortalWrt/g; s/[0-9]+\.[0-9]+-SNAPSHOT/${TARGET_VER}/g" "$rel"
+          done
+          for f in /etc/apk/repositories.d/distfeeds.list /etc/opkg/distfeeds.conf; do
+            if [ -f "$f" ]; then
+              sed -i '/\/nikki\//d; /\/video\//d' "$f"
+              sed -i -E "s/[0-9]+\.[0-9]+-SNAPSHOT/${TARGET_VER}/g" "$f"
+            fi
+          done
+
+          if [ -n "$OFFICIAL_KMOD_DIR" ] && [ -f /etc/apk/repositories.d/distfeeds.list ]; then
+            if ! grep -q "/kmods/" /etc/apk/repositories.d/distfeeds.list; then
+              MIRROR_PREFIX=$(grep -oE '^https?://[^/]+(/[^/]+)*/(releases/[^/]+|snapshots)' /etc/apk/repositories.d/distfeeds.list | head -n 1 || true)
+              if [ -z "$MIRROR_PREFIX" ]; then
+                case "$TARGET_VER" in
+                  *SNAPSHOT*) MIRROR_PREFIX="https://downloads.immortalwrt.org/snapshots" ;;
+                  *)          MIRROR_PREFIX="https://downloads.immortalwrt.org/releases/${TARGET_VER}" ;;
+                esac
+              fi
+              echo "${MIRROR_PREFIX}/targets/${TS_PAIR}/kmods/${OFFICIAL_KMOD_DIR}/packages.adb" >> /etc/apk/repositories.d/distfeeds.list
+            fi
+            KVER=$(uname -r)
+            if [ "${#OFFICIAL_VERMAGIC}" -eq 32 ]; then
+              for apk_db in /etc/apk/world /lib/apk/db/installed; do
+                [ -f "$apk_db" ] && sed -i -E "s/(${KVER}~)[0-9a-f]{32}/\1${OFFICIAL_VERMAGIC}/g" "$apk_db"
+              done
+            fi
+          fi
+          exit 0
+          UCIEOF
+          } > files/etc/uci-defaults/99-z-custom-preset
+          chmod 0755 files/etc/uci-defaults/99-z-custom-preset
+
+      - name: 預下載並驗證 Nikki 對應架構之 Alpha-Smart 核心 (Stage Smart Core)
+        if: ${{ steps.cfg.outputs.need_nikki == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          case "${TS_PAIR}" in
+            x86/64)                         MIHOMO_ARCH="amd64"; ELF_REGEX="x86-64|amd64" ;;
+            x86/generic|x86/geode)          MIHOMO_ARCH="386"; ELF_REGEX="Intel 80386|i386" ;;
+            ramips/mt7621|ramips/mt76x8)    MIHOMO_ARCH="mipsle-softfloat"; ELF_REGEX="MIPS.*LSB" ;;
+            ath79/*)                        MIHOMO_ARCH="mips-softfloat"; ELF_REGEX="MIPS.*MSB" ;;
+            ipq40xx/*|mvebu/cortexa9)       MIHOMO_ARCH="armv7"; ELF_REGEX="ARM," ;;
+            *)                              MIHOMO_ARCH="arm64"; ELF_REGEX="aarch64|arm64" ;;
+          esac
+
+          rm -f /tmp/mihomo-smart*
+          SMART_URL=""
+          SMART_VER=$(curl -fsSL --retry 3 --connect-timeout 10 \
+            https://github.com/vernesong/mihomo/releases/download/Prerelease-Alpha/version.txt 2>/dev/null | tr -d '[:space:]' || true)
+          if [ -n "$SMART_VER" ]; then
+            CAND="https://github.com/vernesong/mihomo/releases/download/Prerelease-Alpha/mihomo-linux-${MIHOMO_ARCH}-${SMART_VER}.gz"
+            curl -fsSLI --retry 2 --connect-timeout 10 "$CAND" >/dev/null 2>&1 && SMART_URL="$CAND"
+          fi
+          if [ -z "$SMART_URL" ]; then
+            RELEASE_JSON=$(curl -fsSL --retry 3 --connect-timeout 10 \
+              -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/vernesong/mihomo/releases/tags/Prerelease-Alpha 2>/dev/null || true)
+            SMART_URL=$(printf '%s\n' "$RELEASE_JSON" \
+              | jq -r --arg arch "$MIHOMO_ARCH" '.assets[]? | select(.name | test("^mihomo-linux-" + $arch + "-(go[0-9]+-)?alpha(-smart)?-[a-zA-Z0-9._-]+\\.gz$")) | .browser_download_url' \
+              | awk 'NR==1' || true)
+          fi
+          if [ -z "$SMART_URL" ] || [ "$SMART_URL" = "null" ]; then
+            EXPANDED_HTML=$(curl -fsSL --retry 3 --connect-timeout 10 https://github.com/vernesong/mihomo/releases/expanded_assets/Prerelease-Alpha 2>/dev/null || true)
+            REL_PATH=$(printf '%s\n' "$EXPANDED_HTML" | grep -oE "/vernesong/mihomo/releases/download/Prerelease-Alpha/mihomo-linux-${MIHOMO_ARCH}-(go[0-9]+-)?alpha(-smart)?-[a-zA-Z0-9._-]+\.gz" | awk 'NR==1' || true)
+            [ -n "$REL_PATH" ] && SMART_URL="https://github.com${REL_PATH}"
+          fi
+          [ -n "$SMART_URL" ] && [ "$SMART_URL" != "null" ] || { echo "::error::無法取得 ${MIHOMO_ARCH} Smart 核心位址！"; exit 1; }
+
+          curl -fsSL --retry 3 --retry-delay 3 -o /tmp/mihomo-smart.gz "$SMART_URL"
+          gzip -d -f /tmp/mihomo-smart.gz
+          if [ ! -s /tmp/mihomo-smart ] || ! file /tmp/mihomo-smart | grep -qiE "ELF.*(${ELF_REGEX})"; then
+            echo "::error::mihomo 核心檔案損毀或不符架構 (${MIHOMO_ARCH})！"; exit 1
+          fi
+          chmod 0755 /tmp/mihomo-smart
+          if command -v upx >/dev/null 2>&1; then
+            cp -f /tmp/mihomo-smart /tmp/mihomo-smart.upx
+            if upx -9 /tmp/mihomo-smart.upx && upx -t /tmp/mihomo-smart.upx; then
+              mv -f /tmp/mihomo-smart.upx /tmp/mihomo-smart
+            else
+              rm -f /tmp/mihomo-smart.upx
+            fi
+          fi
+          ls -lh /tmp/mihomo-smart
+
+      - name: 平台分組 Multi-Profile 與增量雙階段極速編譯 (Compile & Verify)
+        working-directory: ./openwrt
+        run: |
+          set -euo pipefail
+          CANCELLED=0
+          ACTIVE_PID=""
+          kill_tree() {
+            local p="$1" sig="${2:-TERM}" c
+            for c in $(pgrep -P "$p" 2>/dev/null || true); do
+              kill_tree "$c" "$sig"
+            done
+            kill "-${sig}" "$p" 2>/dev/null || true
+          }
+          on_cancel() {
+            CANCELLED=1
+            trap - INT TERM
+            echo "::warning::收到取消信號，正在立即終止所有子進程..."
+            [ -n "$ACTIVE_PID" ] && kill_tree "$ACTIVE_PID" TERM
+            for c in $(pgrep -P $$ 2>/dev/null || true); do kill_tree "$c" TERM; done
+            sleep 1
+            [ -n "$ACTIVE_PID" ] && kill_tree "$ACTIVE_PID" KILL
+            for c in $(pgrep -P $$ 2>/dev/null || true); do kill_tree "$c" KILL; done
+            exit 130
+          }
+          trap on_cancel INT TERM
+          run_interruptible() {
+            local rc=0
+            "$@" &
+            ACTIVE_PID=$!
+            wait "$ACTIVE_PID" || rc=$?
+            ACTIVE_PID=""
+            return "$rc"
+          }
+          BUILD_JOBS=$(( $(nproc) + 1 ))
+          DL_JOBS=$(( $(nproc) * 2 ))
+
+          mkdir -p "$GITHUB_WORKSPACE/collected_firmware"
+          read -r -a RAW_TARGET_ARR <<< "$TARGETS"
+          read -r -a VARIANT_ARR <<< "$VARIANTS"
+
+          MK_GLOB="target/linux/${TARGET_NAME}/image/*.mk"
+          declare -A PROFILE_MAP
+          TARGET_ARR=()
+          SKIPPED_ARR=()
+
+          for dev in "${RAW_TARGET_ARR[@]}"; do
+            # 雙格式 bin+itb 模式下，非 Yuzhii 雙格式特調機型統一由並行 bin Runner 編譯一次，徹底避免跨矩陣重複檔名
+            if [ "$IMG_FMT_MODE" = "bin+itb" ] && [ "$IMG_FMT" = "itb" ]; then
+              case "$dev" in
+                cudy_tr3000-v1|jdcloud_re-cp-03|cmcc_rax3000m-emmc) ;;
+                *) echo "[INFO][bin+itb/itb] ${dev} 已由並行 bin Runner 編譯官方原生格式，此處略過避免重複。"; continue ;;
+              esac
+            fi
+
+            resolved=""
+            if [ "$TS_PAIR" = "mediatek/filogic" ] && [ "$dev" = "cudy_tr3000-v1" ]; then
+              if [ "$IMG_FMT" = "itb" ] && grep -qE '^define Device/cudy_tr3000-v1-ubootmod([[:space:]]|$)' $MK_GLOB 2>/dev/null; then
+                resolved="cudy_tr3000-v1-ubootmod"
+              elif grep -qE '^define Device/cudy_tr3000-v1([[:space:]]|$)' $MK_GLOB 2>/dev/null; then
+                resolved="cudy_tr3000-v1"
+              fi
+            elif [ "$TS_PAIR" = "mediatek/filogic" ] && [ "$dev" = "cmcc_rax3000m-emmc" ]; then
+              if grep -qE '^define Device/cmcc_rax3000m-emmc([[:space:]]|$)' $MK_GLOB 2>/dev/null; then
+                resolved="cmcc_rax3000m-emmc"
+              elif grep -qE '^define Device/cmcc_rax3000m([[:space:]]|$)' $MK_GLOB 2>/dev/null; then
+                resolved="cmcc_rax3000m"
+              fi
+            elif [ "$TARGET_NAME" = "x86" ] && [ "$dev" = "generic" ]; then
+              resolved="generic"
+            else
+              if grep -qE "^define Device/${dev}([[:space:]]|$)" $MK_GLOB 2>/dev/null; then
+                resolved="$dev"
+              elif [ "$IMG_FMT" = "itb" ] && grep -qE "^define Device/${dev}-ubootmod([[:space:]]|$)" $MK_GLOB 2>/dev/null; then
+                resolved="${dev}-ubootmod"
+              fi
+            fi
+
+            if [ -n "$resolved" ]; then
+              PROFILE_MAP["$dev"]="$resolved"
+              TARGET_ARR+=("$dev")
+              echo "[OK] 機型映射: ${TS_PAIR}|${dev} -> [${resolved}]"
+            else
+              echo "::warning::當前分支 (${SOURCE_REF}) 未收錄機型 '${dev}'！"
+              if [ "$SKIP_UNSUPPORTED" = "Y" ]; then
+                SKIPPED_ARR+=("${dev}")
+              else
+                echo "::error::機型 '${dev}' 在 ${SOURCE_REF} 中不存在！"; exit 1
+              fi
+            fi
+          done
+
+          [ "${#TARGET_ARR[@]}" -gt 0 ] || { echo "::error::沒有可編譯的有效機型！"; exit 1; }
+
+          write_base_config() {
+            rm -rf tmp .config
+            cat > .config << EOF
+          CONFIG_TARGET_${TARGET_NAME}=y
+          CONFIG_TARGET_${TARGET_NAME}_${SUBTARGET_NAME}=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          # CONFIG_TARGET_ROOTFS_EXT4FS is not set
+          # CONFIG_TARGET_ROOTFS_TARGZ is not set
+          # CONFIG_TARGET_ROOTFS_CPIOGZ is not set
+          # CONFIG_FEED_nikki is not set
+          # CONFIG_FEED_video is not set
+          CONFIG_DEVEL=y
+          # CONFIG_CCACHE is not set
+          # CONFIG_SDK is not set
+          # CONFIG_IB is not set
+          # CONFIG_MAKE_TOOLCHAIN is not set
+          CONFIG_TARGET_PREINIT_IP="${LAN_IP_VAL}"
+          CONFIG_PACKAGE_default-settings-chn=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_PACKAGE_kmod-mtd-rw=y
+          CONFIG_PACKAGE_ubi-utils=y
+          CONFIG_PACKAGE_e2fsprogs=y
+          CONFIG_PACKAGE_f2fsck=y
+          CONFIG_PACKAGE_mkf2fs=y
+          CONFIG_PACKAGE_fdisk=y
+          CONFIG_PACKAGE_partx-utils=y
+          CONFIG_PACKAGE_losetup=y
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_PACKAGE_uhttpd=y
+          CONFIG_PACKAGE_uhttpd-mod-ubus=y
+          CONFIG_PACKAGE_luci-compat=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+          CONFIG_PACKAGE_kmod-netlink-diag=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_kmod-nft-socket=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_kmod-tun=y
+          EOF
+
+            [ "$ENABLE_BBR" = "Y" ] && echo "CONFIG_PACKAGE_kmod-tcp-bbr=y" >> .config
+            if [ "$ENABLE_ARGON" = "Y" ]; then
+              printf '%s\n' "# CONFIG_PACKAGE_luci-theme-bootstrap is not set" "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
+            else
+              printf '%s\n' "CONFIG_PACKAGE_luci-theme-bootstrap=y" "# CONFIG_PACKAGE_luci-theme-argon is not set" >> .config
+            fi
+            [ "$ENABLE_TTYD" = "Y" ] && printf '%s\n' "CONFIG_PACKAGE_luci-app-ttyd=y" "CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y" >> .config
+            [ "$ENABLE_SFTP" = "Y" ] && printf '%s\n' "CONFIG_PACKAGE_openssh-sftp-server=y" "CONFIG_PACKAGE_openssh-sftp-avahi-service=y" "CONFIG_PACKAGE_avahi-dbus-daemon=y" >> .config
+            if [ "$ENABLE_WWAN" = "Y" ]; then
+              cat >> .config << 'WWAN_EOF'
+          CONFIG_PACKAGE_kmod-mii=y
+          CONFIG_PACKAGE_kmod-usb-wdm=y
+          CONFIG_PACKAGE_kmod-usb-acm=y
+          CONFIG_PACKAGE_kmod-usb-net=y
+          CONFIG_PACKAGE_kmod-usb-net-rndis=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-ether=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-ncm=y
+          CONFIG_PACKAGE_kmod-usb-net-huawei-cdc-ncm=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-mbim=y
+          CONFIG_PACKAGE_kmod-usb-net-qmi-wwan=y
+          CONFIG_PACKAGE_kmod-usb-serial=y
+          CONFIG_PACKAGE_kmod-usb-serial-wwan=y
+          CONFIG_PACKAGE_kmod-usb-serial-option=y
+          CONFIG_PACKAGE_kmod-usb-serial-qualcomm=y
+          CONFIG_PACKAGE_usb-modeswitch=y
+          CONFIG_PACKAGE_uqmi=y
+          CONFIG_PACKAGE_umbim=y
+          CONFIG_PACKAGE_comgt-ncm=y
+          CONFIG_PACKAGE_picocom=y
+          CONFIG_PACKAGE_luci-proto-3g=y
+          CONFIG_PACKAGE_luci-proto-qmi=y
+          CONFIG_PACKAGE_luci-proto-mbim=y
+          CONFIG_PACKAGE_luci-proto-ncm=y
+          WWAN_EOF
+            fi
+
+            if [ "${#TARGET_ARR[@]}" -gt 1 ]; then
+              {
+                echo "CONFIG_TARGET_MULTI_PROFILE=y"
+                echo "CONFIG_TARGET_PER_DEVICE_ROOTFS=y"
+                for dev in "${TARGET_ARR[@]}"; do
+                  local prof="${PROFILE_MAP[$dev]}"
+                  echo "CONFIG_TARGET_DEVICE_${TARGET_NAME}_${SUBTARGET_NAME}_DEVICE_${prof}=y"
+                  echo "CONFIG_TARGET_DEVICE_PACKAGES_${TARGET_NAME}_${SUBTARGET_NAME}_DEVICE_${prof}=\"\""
+                done
+              } >> .config
+            else
+              local prof="${PROFILE_MAP[${TARGET_ARR[0]}]}"
+              echo "CONFIG_TARGET_${TARGET_NAME}_${SUBTARGET_NAME}_DEVICE_${prof}=y" >> .config
+            fi
+          }
+
+          append_pro_config() {
+            if [ "$ENABLE_NIKKI" = "Y" ]; then
+              cat >> .config << 'NIKKI_EOF'
+          CONFIG_PACKAGE_nikki=y
+          CONFIG_PACKAGE_luci-app-nikki=y
+          CONFIG_PACKAGE_luci-i18n-nikki-zh-cn=y
+          # CONFIG_PACKAGE_mihomo is not set
+          # CONFIG_PACKAGE_mihomo-meta is not set
+          # CONFIG_PACKAGE_mihomo-alpha is not set
+          NIKKI_EOF
+            fi
+            if [ "$ENABLE_RTP2HTTPD" = "Y" ]; then
+              cat >> .config << 'RTP_EOF'
+          CONFIG_PACKAGE_rtp2httpd=y
+          CONFIG_PACKAGE_luci-app-rtp2httpd=y
+          CONFIG_PACKAGE_luci-i18n-rtp2httpd-zh-cn=y
+          RTP_EOF
+            fi
+          }
+
+          verify_config() {
+            local edition="$1"
+            make defconfig
+            sed -i 's/^CONFIG_FEED_nikki=y/# CONFIG_FEED_nikki is not set/g' .config
+            sed -i 's/^CONFIG_FEED_video=y/# CONFIG_FEED_video is not set/g' .config
+
+            for dev in "${TARGET_ARR[@]}"; do
+              local prof="${PROFILE_MAP[$dev]}"
+              if [ "${#TARGET_ARR[@]}" -gt 1 ]; then
+                grep -qE "^CONFIG_TARGET_DEVICE_${TARGET_NAME}_${SUBTARGET_NAME}_DEVICE_${prof}=y$" .config || { echo "::error::設備 (${prof}) 未寫入 .config！"; exit 1; }
+              else
+                grep -qE "^CONFIG_TARGET_${TARGET_NAME}_${SUBTARGET_NAME}_DEVICE_${prof}=y$" .config || { echo "::error::設備 (${prof}) 未寫入 .config！"; exit 1; }
+              fi
+            done
+
+            [ "$ENABLE_ARGON" = "Y" ] && { grep -qE '^CONFIG_PACKAGE_luci-theme-argon=y$' .config || { echo "::error::[Argon] 未啟用！"; exit 1; }; }
+            [ "$ENABLE_TTYD" = "Y" ] && { grep -qE '^CONFIG_PACKAGE_luci-app-ttyd=y$' .config || { echo "::error::[TTYD] 未啟用！"; exit 1; }; }
+            [ "$ENABLE_SFTP" = "Y" ] && { grep -qE '^CONFIG_PACKAGE_openssh-sftp-server=y$' .config || { echo "::error::[SFTP] 未啟用！"; exit 1; }; }
+            [ "$ENABLE_WWAN" = "Y" ] && { grep -qE '^CONFIG_PACKAGE_kmod-usb-net=y$' .config || { echo "::error::[WWAN] 未啟用！"; exit 1; }; }
+            [ "$ENABLE_BBR" = "Y" ] && { grep -qE '^CONFIG_PACKAGE_kmod-tcp-bbr=y$' .config || { echo "::error::[BBR] 未啟用！"; exit 1; }; }
+
+            if [ "$edition" = "Pro" ]; then
+              if [ "$ENABLE_NIKKI" = "Y" ]; then
+                for req_pkg in nikki luci-app-nikki; do
+                  grep -qE "^CONFIG_PACKAGE_${req_pkg}=y$" .config || { echo "::error::[Pro][Nikki] ${req_pkg} 未啟用！"; exit 1; }
+                done
+                if grep -qE '^CONFIG_PACKAGE_mihomo.*=y$' .config; then
+                  echo "::error::[Pro][Nikki] 偵測到原版 mihomo 套件被重新啟用！"; exit 1
+                fi
+              fi
+              if [ "$ENABLE_RTP2HTTPD" = "Y" ]; then
+                for req_pkg in rtp2httpd luci-app-rtp2httpd; do
+                  grep -qE "^CONFIG_PACKAGE_${req_pkg}=y$" .config || { echo "::error::[Pro][rtp2httpd] ${req_pkg} 未啟用！"; exit 1; }
+                done
+              fi
+            fi
+          }
+
+          safe_download() {
+            local rc=0
+            run_interruptible make download -j"${DL_JOBS}" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              [ "$CANCELLED" -eq 1 ] || [ "$rc" -ge 128 ] && exit "$rc"
+              rc=0; run_interruptible make download -j"$(nproc)" || rc=$?
+              if [ "$rc" -ne 0 ]; then
+                [ "$CANCELLED" -eq 1 ] || [ "$rc" -ge 128 ] && exit "$rc"
+                run_interruptible make download -j4 V=s
+              fi
+            fi
+            local bad_files
+            bad_files=$(find dl -maxdepth 1 -type f -size -512c ! -name "*.hash" ! -name "*.asc" 2>/dev/null || true)
+            if [ -n "$bad_files" ]; then
+              find dl -maxdepth 1 -type f -size -512c ! -name "*.hash" ! -name "*.asc" -delete
+              run_interruptible make download -j4 V=s
+            fi
+          }
+
+          detect_img_version() {
+            local ver=""
+            if [ -f .config ]; then
+              local cfg_ver
+              cfg_ver=$(grep -E '^CONFIG_VERSION_NUMBER=' .config 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+              [ -n "$cfg_ver" ] && [ "$cfg_ver" != "y" ] && ver="$cfg_ver"
+            fi
+            [ -z "$ver" ] && ver=$(grep -E '^VERSION_NUMBER:=' include/version.mk 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?(-[a-zA-Z0-9]+)?' | awk 'NR==1' || true)
+            echo "${ver:-${RESOLVED_VER}}"
+          }
+
+          COLLECTED_FILES=()
+          declare -A STD_SIZE_MAP
+          declare -A PRO_SIZE_MAP
+
+          collect_and_verify() {
+            local edition="$1" img_ver="$2"
+            local target_dir="bin/targets/${TARGET_NAME}/${SUBTARGET_NAME}"
+            [ -d "$target_dir" ] || target_dir=$(find bin/targets -mindepth 2 -maxdepth 2 -type d | awk 'NR==1')
+            [ -n "$target_dir" ] && [ -d "$target_dir" ] || { echo "::error::找不到韌體輸出目錄！"; exit 1; }
+
+            shopt -s nullglob
+            for dev in "${TARGET_ARR[@]}"; do
+              local prof="${PROFILE_MAP[$dev]}"
+              local is_yuzhii="false"
+              if [ "$TS_PAIR" = "mediatek/filogic" ]; then
+                case "$dev" in cudy_tr3000-v1|jdcloud_re-cp-03|cmcc_rax3000m-emmc) is_yuzhii="true" ;; esac
+              fi
+
+              local src_file="" actual_ext=""
+              if [ "$is_yuzhii" = "true" ]; then
+                local matches=("${target_dir}"/*-"${prof}-squashfs-sysupgrade.${IMG_FMT}")
+                [ "${#matches[@]}" -eq 1 ] || { echo "::error::[${edition}] ${dev} 預期產出 1 個 .${IMG_FMT}，實際找到 ${#matches[@]} 個！"; ls -la "$target_dir"; exit 1; }
+                src_file="${matches[0]}"; actual_ext="${IMG_FMT}"
+              else
+                for pat in \
+                  "${target_dir}"/*-"${prof}-squashfs-sysupgrade.${IMG_FMT}" \
+                  "${target_dir}"/*-"${prof}-squashfs-sysupgrade.bin" \
+                  "${target_dir}"/*-"${prof}-squashfs-sysupgrade.tar" \
+                  "${target_dir}"/*-"${prof}-squashfs-sysupgrade.itb" \
+                  "${target_dir}"/*-"${prof}-squashfs-sysupgrade.img.gz" \
+                  "${target_dir}"/*-"${prof}-squashfs-combined-efi.img.gz" \
+                  "${target_dir}"/*-"${prof}-squashfs-combined.img.gz"; do
+                  if [ -f "$pat" ]; then src_file="$pat"; break; fi
+                done
+                [ -n "$src_file" ] || { echo "::error::[${edition}] ${dev} 未找到有效 sysupgrade 映像！"; ls -la "$target_dir"; exit 1; }
+                case "$src_file" in *.img.gz) actual_ext="img.gz" ;; *) actual_ext="${src_file##*.}" ;; esac
+              fi
+
+              local magic_hex
+              magic_hex=$(xxd -p -l 4 "$src_file" 2>/dev/null || true)
+              if [ "$is_yuzhii" = "true" ]; then
+                if [ "$IMG_FMT" = "itb" ]; then
+                  [ "$magic_hex" = "d00dfeed" ] || { echo "::error::${src_file} 檔頭 (0x${magic_hex}) 非 FIT/ITB！"; exit 1; }
+                else
+                  [ "$dev" = "cudy_tr3000-v1" ] && [ "$magic_hex" != "55424923" ] && { echo "::error::cudy_tr3000-v1 檔頭非 UBI#！"; exit 1; }
+                  [ "$dev" != "cudy_tr3000-v1" ] && [ "$magic_hex" != "73797375" ] && { echo "::error::${dev} 檔頭非 sysupgrade-tar！"; exit 1; }
+                fi
+              else
+                [ -s "$src_file" ] || { echo "::error::${src_file} 為空檔案！"; exit 1; }
+              fi
+
+              local new_name="${dev}-${img_ver}-squashfs-sysupgrade-${edition}.${actual_ext}"
+              cp -f "$src_file" "$GITHUB_WORKSPACE/collected_firmware/${new_name}"
+              COLLECTED_FILES+=("${new_name}")
+              local fsz
+              fsz=$(stat -c%s "$src_file")
+              [ "$edition" = "Std" ] && STD_SIZE_MAP["$dev"]="$fsz"
+              [ "$edition" = "Pro" ] && PRO_SIZE_MAP["$dev"]="$fsz"
+              echo "[OK] 歸檔: ${new_name} (0x${magic_hex}, $(du -h "$src_file" | cut -f1))"
+            done
+          }
+
+          FIRST_PASS="true"
+          IMG_VERSION=""
+          BUILT_NIKKI="no"; BUILT_RTP2HTTPD="no"; BUILT_ARGON="no"; BUILT_TTYD="no"
+          BUILT_SFTP="no"; BUILT_WWAN="no"; BUILT_BBR="no"
+
+          for EDITION in "${VARIANT_ARR[@]}"; do
+            PASS_START=$(date +%s)
+            echo ">>> 建置: ${TS_PAIR} | ${EDITION} | 機型: ${TARGET_ARR[*]} | 格式: ${IMG_FMT} | -j${BUILD_JOBS}"
+
+            if [ "$EDITION" = "Pro" ] && [ "$ENABLE_NIKKI" = "Y" ]; then
+              mkdir -p files/usr/libexec files/usr/bin
+              cp -f /tmp/mihomo-smart files/usr/libexec/mihomo
+              chmod 0755 files/usr/libexec/mihomo
+              ln -sf ../libexec/mihomo files/usr/bin/mihomo
+            fi
+
+            if [ "$FIRST_PASS" = "true" ]; then
+              write_base_config
+              [ "$EDITION" = "Pro" ] && append_pro_config
+              verify_config "$EDITION"
+              safe_download
+              FIRST_PASS="false"
+            else
+              append_pro_config
+              verify_config "$EDITION"
+              safe_download
+              find bin/targets -maxdepth 3 -type f -delete
+              rm -rf build_dir/target-*/root* \
+                "build_dir/target-*/linux-${TARGET_NAME}_${SUBTARGET_NAME}/root"* \
+                "build_dir/target-*/linux-${TARGET_NAME}_${SUBTARGET_NAME}/target-dir-"* \
+                "build_dir/target-*/linux-${TARGET_NAME}_${SUBTARGET_NAME}/tmp"
+            fi
+
+            MAKE_RC=0
+            run_interruptible make -j"${BUILD_JOBS}" || MAKE_RC=$?
+            if [ "$MAKE_RC" -ne 0 ]; then
+              [ "$CANCELLED" -eq 1 ] || [ "$MAKE_RC" -ge 128 ] && exit "$MAKE_RC"
+              echo "::warning::多執行緒遇偶發中斷 (exit ${MAKE_RC})，以 -j$(nproc) 快速重試..."
+              MAKE_RC=0
+              run_interruptible make -j"$(nproc)" || MAKE_RC=$?
+              if [ "$MAKE_RC" -ne 0 ]; then
+                [ "$CANCELLED" -eq 1 ] || [ "$MAKE_RC" -ge 128 ] && exit "$MAKE_RC"
+                run_interruptible make -j1 V=s
+              fi
+            fi
+
+            IMG_VERSION=$(detect_img_version)
+            collect_and_verify "$EDITION" "$IMG_VERSION"
+
+            grep -qE '^CONFIG_PACKAGE_luci-theme-argon=y$' .config && BUILT_ARGON="yes"
+            grep -qE '^CONFIG_PACKAGE_luci-app-ttyd=y$' .config && BUILT_TTYD="yes"
+            grep -qE '^CONFIG_PACKAGE_openssh-sftp-server=y$' .config && BUILT_SFTP="yes"
+            grep -qE '^CONFIG_PACKAGE_kmod-usb-net=y$' .config && BUILT_WWAN="yes"
+            grep -qE '^CONFIG_PACKAGE_kmod-tcp-bbr=y$' .config && BUILT_BBR="yes"
+            if [ "$EDITION" = "Pro" ]; then
+              grep -qE '^CONFIG_PACKAGE_luci-app-nikki=y$' .config && [ -f files/usr/libexec/mihomo ] && BUILT_NIKKI="yes"
+              grep -qE '^CONFIG_PACKAGE_luci-app-rtp2httpd=y$' .config && BUILT_RTP2HTTPD="yes"
+            fi
+
+            PASS_END=$(date +%s)
+            echo "[完成] ${EDITION} 耗時: $(( (PASS_END - PASS_START) / 60 )) 分 $(( (PASS_END - PASS_START) % 60 )) 秒"
+          done
+
+          if [ "${#VARIANT_ARR[@]}" -eq 2 ] && [ "$HAS_PRO_PLUGINS" = "true" ]; then
+            for dev in "${TARGET_ARR[@]}"; do
+              [ "${PRO_SIZE_MAP[$dev]:-0}" -gt "${STD_SIZE_MAP[$dev]:-0}" ] || { echo "::error::異常檢測：${dev} Pro 未大於 Std！"; exit 1; }
+            done
+          fi
+
+          FILES_JSON=$(printf '%s\n' "${COLLECTED_FILES[@]}" | jq -R . | jq -s .)
+          BUILT_DEVS_JSON=$(printf '%s\n' "${TARGET_ARR[@]}" | jq -R . | jq -s .)
+          SKIPPED_DEVS_JSON='[]'
+          [ "${#SKIPPED_ARR[@]}" -gt 0 ] && SKIPPED_DEVS_JSON=$(printf '%s\n' "${SKIPPED_ARR[@]}" | jq -R . | jq -s .)
+
+          jq -n \
+            --arg ts "$TS_PAIR" --arg ts_slug "$TS_SLUG" --arg fmt "$IMG_FMT" \
+            --arg img_version "$IMG_VERSION" --arg upstream_commit_time "$UPSTREAM_COMMIT_TIME" \
+            --arg upstream_commit_hash "$UPSTREAM_COMMIT_HASH" \
+            --arg built_nikki "$BUILT_NIKKI" --arg built_rtp2httpd "$BUILT_RTP2HTTPD" \
+            --arg built_argon "$BUILT_ARGON" --arg built_ttyd "$BUILT_TTYD" \
+            --arg built_sftp "$BUILT_SFTP" --arg built_wwan "$BUILT_WWAN" --arg built_bbr "$BUILT_BBR" \
+            --argjson files "$FILES_JSON" --argjson built_devices "$BUILT_DEVS_JSON" --argjson skipped_devices "$SKIPPED_DEVS_JSON" \
+            '{
+              ts: $ts, ts_slug: $ts_slug, fmt: $fmt, img_version: $img_version,
+              upstream_commit_time: $upstream_commit_time, upstream_commit_hash: $upstream_commit_hash,
+              built_nikki: $built_nikki, built_rtp2httpd: $built_rtp2httpd, built_argon: $built_argon,
+              built_ttyd: $built_ttyd, built_sftp: $built_sftp, built_wwan: $built_wwan, built_bbr: $built_bbr,
+              files: $files, built_devices: $built_devices, skipped_devices: $skipped_devices
+            }' > "$GITHUB_WORKSPACE/collected_firmware/build-meta-${TS_SLUG}-${IMG_FMT}.json"
+
+          {
+            echo "### ImmortalWrt 編譯報告 (\`${TS_PAIR}\` · \`${IMG_FMT}\`)"
+            echo "- **版本**: \`${IMG_VERSION}\` (\`${SOURCE_REF}\` @ \`${UPSTREAM_COMMIT_HASH}\`)"
+            echo "- **機型**: \`${TARGET_ARR[*]}\`"
+            [ "${#SKIPPED_ARR[@]}" -gt 0 ] && echo "- **略過機型**: \`${SKIPPED_ARR[*]}\`"
+            echo ""
+            echo "| 韌體檔案 | 檔案大小 |"
+            echo "| :--- | ---: |"
+            for fn in "${COLLECTED_FILES[@]}"; do
+              echo "| \`${fn}\` | $(du -h "$GITHUB_WORKSPACE/collected_firmware/${fn}" | cut -f1) |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上傳已校驗韌體與元資料 (Upload Firmware Artifacts)
+        uses: actions/upload-artifact@v7
+        with:
+          name: firmwares-${{ steps.cfg.outputs.resolved_ver }}-${{ github.run_id }}-${{ matrix.ts_slug }}-${{ matrix.img_fmt }}
+          path: collected_firmware/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ===========================================================================
+  # 階段 4：統一彙總產物並發佈至 GitHub Releases（串行鎖防發佈競態）
+  # ===========================================================================
+  release:
+    name: 統一發佈至 Releases (Consolidated Release)
+    needs: [prepare, build]
+    if: ${{ needs.prepare.outputs.should_build == 'true' && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: immortalwrt-release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: 下載全部並行編譯成果 (Download All Firmware Artifacts)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: firmwares-${{ needs.prepare.outputs.resolved_ver }}-${{ github.run_id }}-*
+          merge-multiple: true
+          path: all_firmwares
+
+      - name: 驗證檔案完整性並動態生成發佈說明 (Verify & Prepare Release Notes)
+        id: prep_release
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+          BUILD_CONFIG_JSON: ${{ needs.prepare.outputs.build_config_json }}
+          RELEASE_META_JSON: ${{ needs.prepare.outputs.release_meta_json }}
+        run: |
+          set -euo pipefail
+          TZ_NAME=$(printf '%s' "$BUILD_CONFIG_JSON" | jq -r '.tz_name // "Asia/Taipei"')
+          RELEASE_DATE=$(TZ="$TZ_NAME" date "+%Y-%m-%d")
+          FINISH_TIME=$(TZ="$TZ_NAME" date "+%Y年%m月%d日 %H時%M分")
+          RELEASE_TAG="v${RELEASE_DATE}-Build-${RUN_NUMBER}"
+
+          rm -rf release_assets
+          mkdir -p release_assets
+
+          python3 - "$RELEASE_TAG" "$FINISH_TIME" "$RUN_NUMBER" << 'PYEOF'
+          import glob
+          import hashlib
+          import json
+          import os
+          import shutil
+          import sys
+
+          release_tag, finish_time, run_num = sys.argv[1:4]
+          cfg = json.loads(os.environ["BUILD_CONFIG_JSON"])
+          rmeta = json.loads(os.environ["RELEASE_META_JSON"])
+
+          meta_paths = sorted(glob.glob("all_firmwares/build-meta-*.json"))
+          if not meta_paths:
+              print("::error::找不到建置元資料 build-meta-*.json！", file=sys.stderr); sys.exit(1)
+
+          metas = [json.load(open(p, "r", encoding="utf-8")) for p in meta_paths]
+          detected_ver = metas[0].get("img_version") or cfg["resolved_ver"]
+          commit_time = metas[0].get("upstream_commit_time") or cfg["build_start_time"]
+          commit_hash = metas[0].get("upstream_commit_hash") or "latest"
+
+          staged_files, seen_files = [], set()
+          built_profiles, skipped_profiles = set(), set()
+
+          for m in metas:
+              built_profiles.update(m.get("built_devices", []))
+              skipped_profiles.update(m.get("skipped_devices", []))
+              for fn in m.get("files", []):
+                  src = os.path.join("all_firmwares", fn)
+                  if not os.path.isfile(src) or os.path.getsize(src) == 0:
+                      print(f"::error::預期韌體檔案遺失或損毀: {fn}", file=sys.stderr); sys.exit(1)
+                  if fn not in seen_files:
+                      seen_files.add(fn)
+                      shutil.copy2(src, os.path.join("release_assets", fn))
+                      staged_files.append(fn)
+
+          skipped_profiles -= built_profiles
+          staged_files.sort()
+          if not staged_files:
+              print("::error::未收集到任何有效韌體檔案！", file=sys.stderr); sys.exit(1)
+
+          sha_lines = []
+          for fn in staged_files:
+              h = hashlib.sha256()
+              with open(os.path.join("release_assets", fn), "rb") as f:
+                  for chunk in iter(lambda: f.read(1048576), b""): h.update(chunk)
+              sha_lines.append(f"{h.hexdigest()}  {fn}")
+          sha_content = "\n".join(sha_lines)
+          open(os.path.join("release_assets", "sha256sums.txt"), "w", encoding="utf-8").write(sha_content + "\n")
+
+          def agg_built(key: str) -> str:
+              return "yes" if all(m.get(key) == "yes" for m in metas) else "no"
+
+          built_nikki, built_rtp = agg_built("built_nikki"), agg_built("built_rtp2httpd")
+          built_argon, built_ttyd = agg_built("built_argon"), agg_built("built_ttyd")
+          built_sftp, built_wwan, built_bbr = agg_built("built_sftp"), agg_built("built_wwan"), agg_built("built_bbr")
+
+          img_fmt = cfg["img_fmt_mode"]
+          if img_fmt == "bin+itb":
+              img_fmt_upper = "BIN + ITB"
+              fmt_desc = "同時提供原生 **BIN**（適配 Yuzhii0718 `bl-mt798x-dhcpd` U-Boot 與各機型官方原生格式）與原生 **ITB**（適配 OpenWrt 主線 `fitblk` U-Boot Mod，FIT Magic `0xd00dfeed`）雙格式映像"
+          elif img_fmt == "itb":
+              img_fmt_upper = "ITB"
+              fmt_desc = "遵循 OpenWrt 官方主線 FIT（Flattened Image Tree，Magic `0xd00dfeed`）標準規範，其餘原生非 FIT 機型保留官方原生格式"
+          else:
+              img_fmt_upper = "BIN"
+              fmt_desc = "針對 Yuzhii0718 `bl-mt798x-dhcpd` U-Boot 機型進行 SPI-NAND（`UBI#`）與 eMMC（`sysupgrade-tar`）深度封裝，其餘機型完整保留 ImmortalWrt 官方原生映像封裝"
+
+          variants = cfg["variants"].split()
+          has_std, has_pro = "Std" in variants, "Pro" in variants
+          base_scope = "Std + Pro" if (has_std and has_pro) else ("Pro" if has_pro else "Std")
+
+          theme_desc = "`Argon` 現代化視覺介面" if built_argon == "yes" else "`Bootstrap` 官方原生介面"
+          lan_ip, hostname_val = cfg["lan_ip"], cfg["hostname"]
+          login_user, login_pass = cfg["login_user"], cfg["login_pass"]
+          country_label, tz_name, tz_posix = cfg["country_label"], cfg["tz_name"], cfg["tz_posix"]
+
+          user_desc = "`root`" if login_user == "root" else f"`{login_user}`（完整 LuCI / SSH 權限，底層保留 `root`）"
+          user_note = "使用系統預設超級管理員帳號 `root`。" if login_user == "root" else f"已自訂管理員帳號 `{login_user}`（具 LuCI `rpcd` 與 SSH 完整管理權限），底層同步保留 `root` 並套用相同密碼規則。"
+          pass_desc = f"`{login_pass}`（SHA-512 雜湊預置）" if login_pass else "預設免密碼（留空直接登入）"
+          pass_note = f"預設密碼為 `{login_pass}`（以 SHA-512 雜湊寫入系統），建議首次登入後至「系統 → 管理權限」修改。" if login_pass else "預設免密碼（密碼欄留空即可登入），建議首次登入後立即至「系統 → 管理權限」設定密碼。"
+
+          plugin_defs = [
+              ("Nikki 透明代理 + Alpha-Smart 核心", "Pro 專屬", cfg["enable_nikki"], built_nikki, "Pro",
+               "`nikki`、`luci-app-nikki`、中文語言包與官方最新 `vernesong/mihomo` Alpha-Smart 核心", ""),
+              ("rtp2httpd IPTV 串流轉發", "Pro 專屬", cfg["enable_rtp2httpd"], built_rtp, "Pro",
+               "`rtp2httpd` 原生 C 版、`luci-app-rtp2httpd` 與中文語言包", ""),
+              ("Argon 視覺主題", "標準版 (Std)", cfg["enable_argon"], built_argon, base_scope,
+               "`luci-theme-argon` 並設為預設介面主題", "改回使用官方 `Bootstrap` 主題"),
+              ("TTYD Web 網頁終端機", "標準版 (Std)", cfg["enable_ttyd"], built_ttyd, base_scope,
+               "`luci-app-ttyd` 與中文語言包", ""),
+              ("OpenSSH SFTP + Avahi mDNS", "標準版 (Std)", cfg["enable_sftp"], built_sftp, base_scope,
+               "`openssh-sftp-server`、`openssh-sftp-avahi-service` 與 `avahi-dbus-daemon`", ""),
+              ("5G / 4G 行動寬頻與 USB 共享驅動", "標準版 (Std)", cfg["enable_wwan"], built_wwan, base_scope,
+               "QMI / MBIM / NCM / RNDIS / ECM 蜂巢與手機 USB 共享驅動、`usb-modeswitch` 與 `picocom`", ""),
+              ("TCP BBR 高速擁塞控制", "標準版 (Std)", cfg["enable_bbr"], built_bbr, base_scope,
+               "`kmod-tcp-bbr` 並預設啟用", ""),
+          ]
+
+          plugin_rows, inc_lines, exc_lines = [], [], []
+          for pname, tier, sw, built, scope, detail, off_note in plugin_defs:
+              if built == "yes":
+                  plugin_rows.append(f"| **{pname}** | {tier} | `{sw}` | ✅ 已整合編譯（{scope}） | {detail} |")
+                  inc_lines.append(f"- **{pname}**（`{scope}`）：{detail}")
+              else:
+                  if sw == "N": reason = f"開關設為 `N`{('；' + off_note) if off_note else ''}"
+                  elif tier == "Pro 專屬" and not has_pro: reason = "本次僅編譯 `Std` 版本，未建置 `Pro` 專屬模組"
+                  else: reason = "未參與本次編譯"
+                  plugin_rows.append(f"| **{pname}** | {tier} | `{sw}` | ⬜ 未整合編譯 | {reason} |")
+                  exc_lines.append(f"- **{pname}**（開關 `{sw}`）：未整合編譯 — {reason}")
+
+          if not inc_lines: inc_lines.append("- 無（純淨官方基礎系統）")
+          if not exc_lines: exc_lines.append("- 無（全部可選插件模組均已整合編譯）")
+
+          std_items = []
+          if built_argon == "yes": std_items.append("**Argon 主題**")
+          if built_ttyd == "yes": std_items.append("**TTYD 終端**")
+          if built_sftp == "yes": std_items.append("**SFTP + mDNS**")
+          if built_wwan == "yes": std_items.append("**5G/4G 行動寬頻**")
+          if built_bbr == "yes": std_items.append("**TCP BBR**")
+          std_desc = "、".join(std_items) if std_items else "純淨官方 LuCI 基礎系統"
+
+          pro_items = []
+          if built_nikki == "yes": pro_items.append("**Nikki 透明代理**（`Alpha-Smart` 核心）")
+          if built_rtp == "yes": pro_items.append("**rtp2httpd 原生 C 版**")
+          if pro_items:
+              pro_extra = "、".join(pro_items)
+              pro_desc = f"包含 **`Std`** 全部功能，額外整合 {pro_extra}" if has_std else f"包含基礎模組（{std_desc}），額外整合 {pro_extra}"
+          else:
+              pro_desc = "包含 **`Std`** 全部功能（未啟用額外 Pro 插件）" if has_std else f"包含基礎模組（{std_desc}）"
+
+          ver_rows = []
+          if has_std and has_pro:
+              ver_intro = "提供 **Standard（`Std`）** 與 **Pro（`Pro`）** 雙版本："
+              ver_rows.append(f"| **`Std`** | Standard 標準版 | `*-Std.*` | {std_desc} |")
+              ver_rows.append(f"| **`Pro`** | Professional 專業版 | `*-Pro.*` | {pro_desc} |")
+          elif has_std:
+              ver_intro = "本次僅建置 **Standard（`Std`）** 標準版："
+              ver_rows.append(f"| **`Std`** | Standard 標準版 | `*-Std.*` | {std_desc} |")
+          else:
+              ver_intro = "本次僅建置 **Pro（`Pro`）** 專業版："
+              ver_rows.append(f"| **`Pro`** | Professional 專業版 | `*-Pro.*` | {pro_desc} |")
+
+          dev_rows, skipped_rows = [], []
+          def boot_env_for(prof: str, ts: str) -> str:
+              if ts == "mediatek/filogic" and prof == "cudy_tr3000-v1":
+                  if img_fmt == "itb": return "OpenWrt U-Boot Mod (`fitblk`)"
+                  if img_fmt == "bin+itb": return "BIN: Yuzhii (112MB UBI) / ITB: U-Boot Mod (`fitblk`)"
+                  return "Yuzhii `bl-mt798x-dhcpd` (112MB UBI)"
+              if ts == "mediatek/filogic" and prof in ("jdcloud_re-cp-03", "cmcc_rax3000m-emmc"):
+                  if img_fmt == "itb": return "OpenWrt U-Boot Mod (`fitblk`)"
+                  if img_fmt == "bin+itb": return "BIN: Yuzhii (eMMC) / ITB: U-Boot Mod (`fitblk`)"
+                  return "Yuzhii `bl-mt798x-dhcpd` (eMMC)"
+              return "原廠 U-Boot / ImmortalWrt 官方原生引導"
+
+          for d in rmeta["devices"]:
+              p = d["profile"]
+              if p in built_profiles:
+                  dev_rows.append(f"| **{d['name']}** | `{d['ts']}` | `{p}` | {d['spec']} | {boot_env_for(p, d['ts'])} |")
+              elif p in skipped_profiles:
+                  skipped_rows.append(f"- **{d['name']}**（`{d['ts']}` · `{p}`）：當前分支（`{detected_ver}`）上游尚未收錄，已自動略過")
+
+          notes_parts = [
+              f"## ImmortalWrt {detected_ver}",
+              "",
+              f"> 本版韌體於 **{cfg['build_start_time']}** 啟動雲端純淨建置（{rmeta['trigger_label']} · {rmeta['change_reason']}），同步 ImmortalWrt 官方主線截至 **{commit_time}**（Commit `{commit_hash}`）。映像封裝：**{img_fmt_upper}**，{fmt_desc}。",
+              "",
+              "### 系統概覽與固件預設",
+              "",
+              "| 項目 | 預設規格 |",
+              "| :--- | :--- |",
+              f"| **系統版本** | ImmortalWrt `{detected_ver}`（繁簡中文介面） |",
+              f"| **韌體格式** | 原生 **`{img_fmt_upper}`**（通過二進位檔頭校驗） |",
+              f"| **預設 LAN 位址** | `http://{lan_ip}`（遮罩 `255.255.255.0` · 主機名：`{hostname_val}`） |",
+              f"| **預設登入帳號** | {user_desc} |",
+              f"| **預設登入密碼** | {pass_desc} |",
+              f"| **國家/地區** | {country_label}（無線監管域已預設套用） |",
+              f"| **系統時區** | `{tz_name}`（POSIX: `{tz_posix}`） |",
+              f"| **桌面主題** | {theme_desc} |",
+              f"| **觸發來源** | {rmeta['trigger_label']} · {rmeta['change_reason']} |",
+              f"| **建置時間** | {cfg['build_start_time']} 開編 · {finish_time} 發佈（Build `#{run_num}`） |",
+              "",
+              "### 網路與預設登入說明",
+              "",
+              f"- **網頁後台 (LuCI)**：`http://{lan_ip}`（主機名 `{hostname_val}`）",
+              f"- **SSH 終端連線**：`ssh {login_user}@{lan_ip}`",
+              f"- **帳號說明**：{user_note}",
+              f"- **密碼說明**：{pass_note}",
+              "",
+              "### 版本陣容",
+              "",
+              ver_intro,
+              "",
+              "| 代號 | 版本定位 | 檔名標識 | 預載應用與服務 |",
+              "| :--- | :--- | :--- | :--- |",
+              *ver_rows,
+              "",
+              "### 插件模組整合與編譯清單",
+              "",
+              "| 插件模組 | 歸屬 | 開關 | 實際編譯狀態 | 說明 / 套件內容 |",
+              "| :--- | :--- | :---: | :--- | :--- |",
+              *plugin_rows,
+              "",
+              "#### ✅ 本次已整合編譯",
+              "",
+              *inc_lines,
+              "",
+              "#### ⬜ 本次未整合編譯",
+              "",
+              *exc_lines,
+              "",
+              "### 本次編譯機型與硬體規格",
+              "",
+              "| 機型名稱 | 平台架構 | 韌體代號 (Profile) | 處理器與儲存配置 | 適配引導環境 |",
+              "| :--- | :--- | :--- | :--- | :--- |",
+              *dev_rows,
+          ]
+          if skipped_rows:
+              notes_parts.extend(["", "#### ⚠️ 本次自動略過機型（當前分支上游尚未收錄）", "", *skipped_rows])
+          notes_parts.extend([
+              "",
+              "### 檔案校驗 (SHA-256)",
+              "",
+              "```text",
+              sha_content,
+              "```",
+              "",
+              f"<!-- UPSTREAM_FINGERPRINT:{rmeta['upstream_fingerprint']} -->",
+          ])
+          if rmeta.get("sched_marker"):
+              notes_parts.append(f"<!-- SCHED_BUILD_DAY:{rmeta['sched_marker']} -->")
+          notes_parts.append("")
+
+          open("release_notes.md", "w", encoding="utf-8").write("\n".join(notes_parts))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"release_tag={release_tag}\n")
+              f.write(f"detected_ver={detected_ver}\n")
+              f.write(f"img_fmt_upper={img_fmt_upper}\n")
+          print(f"[OK] 已校驗並整理 {len(staged_files)} 個韌體檔，發佈標籤: {release_tag}")
+          PYEOF
+
+      - name: 發佈至 GitHub Releases (Create Unified Release)
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.prep_release.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: "ImmortalWrt ${{ steps.prep_release.outputs.detected_ver }} (${{ steps.prep_release.outputs.img_fmt_upper }}) · ${{ steps.prep_release.outputs.release_tag }}"
+          body_path: release_notes.md
+          files: |
+            release_assets/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+
+  # ===========================================================================
+  # 階段 5：立即回收本次臨時共享工具鏈產物（不佔倉庫儲存空間）
+  # ===========================================================================
+  cleanup_ephemeral:
+    name: 回收單次臨時工具鏈 (Cleanup Ephemeral Toolchain)
+    needs: [prepare, toolchain, build]
+    if: ${{ always() && needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.has_shared_tc == 'true' && needs.toolchain.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: 刪除本次執行產生之臨時工具鏈 Artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          ARTIFACTS_JSON=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${REPO_FULL}/actions/runs/${RUN_ID}/artifacts?per_page=100" 2>/dev/null || echo '{"artifacts":[]}')
+          IDS=$(printf '%s' "$ARTIFACTS_JSON" | jq -r '.artifacts[]? | select(.name | startswith("ephemeral-tc-")) | .id' || true)
+          for aid in $IDS; do
+            curl -fsSL -X DELETE \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${REPO_FULL}/actions/artifacts/${aid}" || true
+          done
+          echo "[OK] 臨時工具鏈清理完成。"
